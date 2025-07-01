@@ -16,7 +16,6 @@ from budflow.core.oauth2_flow import (
     OAuth2FlowManager,
     OAuth2Config,
     OAuth2Provider,
-    OAuth2Flow,
     OAuth2Token,
     OAuth2State,
     OAuth2Error,
@@ -112,6 +111,12 @@ def oauth2_flow_manager():
     return OAuth2FlowManager()
 
 
+@pytest.fixture
+def state_manager():
+    """Create OAuth2 state manager."""
+    return StateManager()
+
+
 @pytest.mark.unit
 class TestOAuth2Config:
     """Test OAuth2 configuration."""
@@ -132,6 +137,7 @@ class TestOAuth2Config:
             client_id="client123",
             authorization_url="https://auth.example.com/authorize",
             token_url="https://auth.example.com/token",
+            redirect_uri="https://app.example.com/callback",
         )
         assert config.provider_name == "valid"
         
@@ -142,6 +148,7 @@ class TestOAuth2Config:
                 client_id="client123",
                 authorization_url="not-a-url",
                 token_url="https://auth.example.com/token",
+                redirect_uri="https://app.example.com/callback",
             )
     
     def test_scope_handling(self, oauth2_config):
