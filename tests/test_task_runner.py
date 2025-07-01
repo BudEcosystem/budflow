@@ -1,761 +1,619 @@
-"""Test task runner implementation."""
+"""Tests for task runner implementation."""
 
+import pytest
 import asyncio
 import json
 import os
-import time
-from datetime import datetime, timedelta, timezone
-from typing import Dict, Any, Optional
-from unittest.mock import Mock, patch, AsyncMock, MagicMock
-
-import pytest
+from unittest.mock import Mock, AsyncMock, patch, MagicMock
+from datetime import datetime, timezone
 
 from budflow.executor.task_runner import (
     TaskRunner,
+    DockerTaskRunner,
+    ProcessTaskRunner,
     TaskRunnerConfig,
     TaskRunnerMode,
-    TaskRequest,
     TaskResult,
-    TaskStatus,
-    TaskOffer,
-    TaskRunnerProcess,
-    TaskBroker,
+    TaskError,
+    TaskTimeout,
+    TaskMemoryExceeded,
+    TaskExecutionError,
     ResourceLimits,
-    SecurityConfig,
-    TaskRunnerError,
-    TaskTimeoutError,
-    ResourceLimitError,
-    SecurityViolationError,
-    SecuritySandbox,
-    CodeAnalyzer,
-    ResourceLimitEnforcer,
+    DockerConfig,
+    ProcessConfig,
 )
 
 
 @pytest.fixture
-def task_runner_config():
-    """Create test task runner configuration."""
-    return TaskRunnerConfig(
-        mode=TaskRunnerMode.INTERNAL,
-        max_concurrency=2,
-        task_timeout=30,  # seconds
-        heartbeat_interval=5,
-        max_memory_mb=512,
-        max_cpu_percent=50,
-        max_payload_size_mb=100,
-        allowed_modules=["json", "datetime", "math"],
-        enable_sandboxing=True,
-        enable_prototype_pollution_prevention=True,
-    )
-
-
-@pytest.fixture
 def resource_limits():
-    """Create test resource limits."""
+    """Create resource limits."""
     return ResourceLimits(
-        max_memory_mb=512,
-        max_cpu_percent=50,
-        max_execution_time_seconds=30,
-        max_payload_size_mb=100,
+        memory_mb=512,
+        cpu_cores=1.0,
+        disk_mb=1024,
+        timeout_seconds=30,
+        max_output_size=1024 * 1024  # 1MB
     )
 
 
 @pytest.fixture
-def security_config():
-    """Create test security configuration."""
-    return SecurityConfig(
-        enable_sandboxing=True,
-        allowed_builtin_modules=["json", "datetime", "math"],
-        allowed_external_modules=[],
-        enable_prototype_pollution_prevention=True,
-        enable_code_analysis=True,
-        disallow_code_generation=True,
+def docker_config(resource_limits):
+    """Create Docker configuration."""
+    return DockerConfig(
+        image="python:3.11-slim",
+        network_mode="none",
+        remove_container=True,
+        environment={},
+        volumes={},
+        working_dir="/app",
+        user="nobody",
+        resource_limits=resource_limits
     )
 
 
-@pytest.mark.unit
-class TestTaskRequest:
-    """Test TaskRequest model."""
-    
-    def test_task_request_creation(self):
-        """Test creating a task request."""
-        request = TaskRequest(
-            task_id="task-123",
-            code="return 2 + 2",
-            context={"items": [1, 2, 3]},
-            required_modules=["json"],
-            timeout=10,
-        )
-        
-        assert request.task_id == "task-123"
-        assert request.code == "return 2 + 2"
-        assert request.context == {"items": [1, 2, 3]}
-        assert request.required_modules == ["json"]
-        assert request.timeout == 10
-    
-    def test_task_request_validation(self):
-        """Test task request validation."""
-        # Test invalid timeout
-        with pytest.raises(ValueError):
-            TaskRequest(
-                task_id="task-123",
-                code="return 1",
-                timeout=-1,
-            )
-        
-        # Test oversized payload
-        with pytest.raises(ValueError):
-            large_context = {"data": "x" * (1024 * 1024 * 1024)}  # 1GB
-            TaskRequest(
-                task_id="task-123",
-                code="return 1",
-                context=large_context,
-            )
+@pytest.fixture
+def process_config(resource_limits):
+    """Create process configuration."""
+    return ProcessConfig(
+        python_path="/usr/bin/python3",
+        working_dir="/tmp",
+        environment={},
+        resource_limits=resource_limits,
+        use_sandbox=True
+    )
 
 
-@pytest.mark.unit
-class TestTaskResult:
-    """Test TaskResult model."""
+@pytest.fixture
+def task_runner_config():
+    """Create task runner configuration."""
+    return TaskRunnerConfig(
+        mode=TaskRunnerMode.DOCKER,
+        docker_socket="/var/run/docker.sock",
+        enable_network=False,
+        allowed_modules=["json", "datetime", "math"],
+        blocked_modules=["os", "subprocess", "socket"],
+        log_output=True
+    )
+
+
+class TestDockerTaskRunner:
+    """Test Docker-based task runner."""
     
-    def test_task_result_success(self):
-        """Test successful task result."""
-        result = TaskResult(
-            task_id="task-123",
-            status=TaskStatus.COMPLETED,
-            result={"output": 42},
-            execution_time_ms=100,
-        )
+    @pytest.mark.asyncio
+    async def test_run_simple_code(self, docker_config):
+        """Test running simple Python code."""
+        with patch('docker.from_env') as mock_docker:
+            # Mock Docker client
+            mock_client = Mock()
+            mock_docker.return_value = mock_client
+            
+            # Mock container
+            mock_container = Mock()
+            mock_container.logs.return_value = b'{"result": 42}'
+            mock_container.wait.return_value = {"StatusCode": 0}
+            mock_container.attrs = {"State": {"ExitCode": 0}}
+            
+            mock_client.containers.run.return_value = mock_container
+            
+            # Create runner
+            runner = DockerTaskRunner(docker_config)
+            
+            # Run code
+            code = """
+result = 21 * 2
+print(json.dumps({"result": result}))
+"""
+            result = await runner.run(code, {})
+            
+            assert result.success is True
+            assert result.output == {"result": 42}
+            assert result.error is None
+            assert result.exit_code == 0
+    
+    @pytest.mark.asyncio
+    async def test_run_with_input_data(self, docker_config):
+        """Test running code with input data."""
+        with patch('docker.from_env') as mock_docker:
+            # Mock Docker client
+            mock_client = Mock()
+            mock_docker.return_value = mock_client
+            
+            # Mock container
+            mock_container = Mock()
+            mock_container.logs.return_value = b'{"sum": 15}'
+            mock_container.wait.return_value = {"StatusCode": 0}
+            mock_container.attrs = {"State": {"ExitCode": 0}}
+            
+            mock_client.containers.run.return_value = mock_container
+            
+            # Create runner
+            runner = DockerTaskRunner(docker_config)
+            
+            # Run code with input
+            code = """
+import json
+input_data = json.loads(INPUT_DATA)
+result = sum(input_data["numbers"])
+print(json.dumps({"sum": result}))
+"""
+            input_data = {"numbers": [1, 2, 3, 4, 5]}
+            result = await runner.run(code, input_data)
+            
+            assert result.success is True
+            assert result.output == {"sum": 15}
+    
+    @pytest.mark.asyncio
+    async def test_timeout_handling(self, docker_config):
+        """Test timeout handling."""
+        with patch('docker.from_env') as mock_docker:
+            # Mock Docker client
+            mock_client = Mock()
+            mock_docker.return_value = mock_client
+            
+            # Mock container that times out
+            mock_container = Mock()
+            mock_container.logs.return_value = b''
+            mock_container.wait.side_effect = asyncio.TimeoutError()
+            mock_container.kill = Mock()
+            
+            mock_client.containers.run.return_value = mock_container
+            
+            # Create runner with short timeout
+            docker_config.resource_limits.timeout_seconds = 1
+            runner = DockerTaskRunner(docker_config)
+            
+            # Run code that times out
+            code = """
+import time
+time.sleep(10)
+"""
+            with pytest.raises(TaskTimeout):
+                await runner.run(code, {})
+            
+            # Verify container was killed
+            mock_container.kill.assert_called_once()
+    
+    @pytest.mark.asyncio
+    async def test_memory_limit(self, docker_config):
+        """Test memory limit enforcement."""
+        with patch('docker.from_env') as mock_docker:
+            # Mock Docker client
+            mock_client = Mock()
+            mock_docker.return_value = mock_client
+            
+            # Mock container that exceeds memory
+            mock_container = Mock()
+            mock_container.logs.return_value = b'Killed'
+            mock_container.wait.return_value = {"StatusCode": 137}  # OOM kill
+            mock_container.attrs = {"State": {"OOMKilled": True}}
+            
+            mock_client.containers.run.return_value = mock_container
+            
+            # Create runner
+            runner = DockerTaskRunner(docker_config)
+            
+            # Run code that uses too much memory
+            code = """
+# Allocate lots of memory
+data = [0] * (1024 * 1024 * 1024)  # 1GB
+"""
+            with pytest.raises(TaskMemoryExceeded):
+                await runner.run(code, {})
+    
+    @pytest.mark.asyncio
+    async def test_syntax_error_handling(self, docker_config):
+        """Test syntax error handling."""
+        with patch('docker.from_env') as mock_docker:
+            # Mock Docker client
+            mock_client = Mock()
+            mock_docker.return_value = mock_client
+            
+            # Mock container with syntax error
+            error_output = b'SyntaxError: invalid syntax'
+            mock_container = Mock()
+            mock_container.logs.return_value = error_output
+            mock_container.wait.return_value = {"StatusCode": 1}
+            mock_container.attrs = {"State": {"ExitCode": 1}}
+            
+            mock_client.containers.run.return_value = mock_container
+            
+            # Create runner
+            runner = DockerTaskRunner(docker_config)
+            
+            # Run code with syntax error
+            code = """
+def broken(
+    print("missing closing paren")
+"""
+            result = await runner.run(code, {})
+            
+            assert result.success is False
+            assert result.exit_code == 1
+            assert "SyntaxError" in str(result.error)
+    
+    @pytest.mark.asyncio
+    async def test_output_size_limit(self, docker_config):
+        """Test output size limit."""
+        with patch('docker.from_env') as mock_docker:
+            # Mock Docker client
+            mock_client = Mock()
+            mock_docker.return_value = mock_client
+            
+            # Mock container with large output
+            large_output = b'x' * (2 * 1024 * 1024)  # 2MB
+            mock_container = Mock()
+            mock_container.logs.return_value = large_output
+            mock_container.wait.return_value = {"StatusCode": 0}
+            mock_container.attrs = {"State": {"ExitCode": 0}}
+            
+            mock_client.containers.run.return_value = mock_container
+            
+            # Create runner
+            runner = DockerTaskRunner(docker_config)
+            
+            # Run code
+            code = 'print("x" * (2 * 1024 * 1024))'
+            
+            with pytest.raises(TaskExecutionError) as exc_info:
+                await runner.run(code, {})
+            
+            assert "Output size exceeded" in str(exc_info.value)
+    
+    @pytest.mark.asyncio
+    async def test_cleanup_on_error(self, docker_config):
+        """Test container cleanup on error."""
+        with patch('docker.from_env') as mock_docker:
+            # Mock Docker client
+            mock_client = Mock()
+            mock_docker.return_value = mock_client
+            
+            # Mock container that fails
+            mock_container = Mock()
+            mock_container.logs.side_effect = Exception("Docker error")
+            mock_container.remove = Mock()
+            
+            mock_client.containers.run.return_value = mock_container
+            
+            # Create runner
+            runner = DockerTaskRunner(docker_config)
+            
+            # Run code that fails
+            try:
+                await runner.run("print('test')", {})
+            except:
+                pass
+            
+            # Verify cleanup
+            mock_container.remove.assert_called_once()
+
+
+class TestProcessTaskRunner:
+    """Test process-based task runner."""
+    
+    @pytest.mark.asyncio
+    async def test_run_simple_code(self, process_config):
+        """Test running simple Python code."""
+        # Create runner
+        runner = ProcessTaskRunner(process_config)
         
-        assert result.task_id == "task-123"
-        assert result.status == TaskStatus.COMPLETED
-        assert result.result == {"output": 42}
+        # Run code
+        code = """
+import json
+result = 21 * 2
+print(json.dumps({"result": result}))
+"""
+        result = await runner.run(code, {})
+        
+        assert result.success is True
+        assert result.output == {"result": 42}
         assert result.error is None
-        assert result.execution_time_ms == 100
+        assert result.exit_code == 0
     
-    def test_task_result_failure(self):
-        """Test failed task result."""
-        result = TaskResult(
-            task_id="task-123",
-            status=TaskStatus.FAILED,
-            error="Division by zero",
-            error_details={"type": "ZeroDivisionError"},
-            execution_time_ms=50,
-        )
+    @pytest.mark.asyncio
+    async def test_run_with_input_data(self, process_config):
+        """Test running code with input data."""
+        # Create runner
+        runner = ProcessTaskRunner(process_config)
         
-        assert result.task_id == "task-123"
-        assert result.status == TaskStatus.FAILED
-        assert result.error == "Division by zero"
-        assert result.error_details == {"type": "ZeroDivisionError"}
-        assert result.result is None
-
-
-@pytest.mark.unit
-class TestTaskOffer:
-    """Test TaskOffer model."""
+        # Run code with input
+        code = """
+import json
+import os
+input_data = json.loads(os.environ.get('INPUT_DATA', '{}'))
+result = sum(input_data["numbers"])
+print(json.dumps({"sum": result}))
+"""
+        input_data = {"numbers": [1, 2, 3, 4, 5]}
+        result = await runner.run(code, input_data)
+        
+        assert result.success is True
+        assert result.output == {"sum": 15}
     
-    def test_task_offer_creation(self):
-        """Test creating a task offer."""
-        offer = TaskOffer(
-            offer_id="offer-123",
-            runner_id="runner-1",
-            valid_until=datetime.now(timezone.utc) + timedelta(seconds=30),
-            capabilities=["python", "restricted"],
-        )
+    @pytest.mark.asyncio
+    async def test_timeout_handling(self, process_config):
+        """Test timeout handling."""
+        # Create runner with short timeout
+        process_config.resource_limits.timeout_seconds = 0.1
+        runner = ProcessTaskRunner(process_config)
         
-        assert offer.offer_id == "offer-123"
-        assert offer.runner_id == "runner-1"
-        assert offer.is_valid()
-        assert "python" in offer.capabilities
+        # Run code that times out
+        code = """
+import time
+time.sleep(10)
+"""
+        with pytest.raises(TaskTimeout):
+            await runner.run(code, {})
     
-    def test_task_offer_expiration(self):
-        """Test task offer expiration."""
-        # Create expired offer
-        offer = TaskOffer(
-            offer_id="offer-123",
-            runner_id="runner-1",
-            valid_until=datetime.now(timezone.utc) - timedelta(seconds=1),
-        )
+    @pytest.mark.asyncio
+    async def test_blocked_module_detection(self, process_config):
+        """Test blocked module detection."""
+        # Create runner
+        runner = ProcessTaskRunner(process_config)
         
-        assert not offer.is_valid()
+        # Try to import blocked module
+        code = """
+import os
+print(os.environ)
+"""
+        result = await runner.run(code, {})
+        
+        assert result.success is False
+        assert "blocked module" in str(result.error).lower()
+    
+    @pytest.mark.asyncio
+    async def test_sandbox_restrictions(self, process_config):
+        """Test sandbox restrictions."""
+        # Create runner with sandbox
+        runner = ProcessTaskRunner(process_config)
+        
+        # Try to access filesystem
+        code = """
+with open('/etc/passwd', 'r') as f:
+    print(f.read())
+"""
+        result = await runner.run(code, {})
+        
+        assert result.success is False
+        assert result.exit_code != 0
 
 
-@pytest.mark.unit
-class TestResourceLimits:
+class TestTaskRunnerFactory:
+    """Test task runner factory."""
+    
+    def test_create_docker_runner(self, task_runner_config):
+        """Test creating Docker runner."""
+        task_runner_config.mode = TaskRunnerMode.DOCKER
+        
+        runner = TaskRunner.create(task_runner_config)
+        
+        assert isinstance(runner, DockerTaskRunner)
+    
+    def test_create_process_runner(self, task_runner_config):
+        """Test creating process runner."""
+        task_runner_config.mode = TaskRunnerMode.PROCESS
+        
+        runner = TaskRunner.create(task_runner_config)
+        
+        assert isinstance(runner, ProcessTaskRunner)
+    
+    def test_invalid_mode(self, task_runner_config):
+        """Test invalid runner mode."""
+        task_runner_config.mode = "invalid"
+        
+        with pytest.raises(ValueError):
+            TaskRunner.create(task_runner_config)
+
+
+class TestResourceEnforcement:
     """Test resource limit enforcement."""
     
     @pytest.mark.asyncio
-    async def test_memory_limit_enforcement(self, resource_limits):
-        """Test memory limit enforcement."""
-        with patch('budflow.executor.task_runner.resource_limiter.psutil') as mock_psutil, \
-             patch('budflow.executor.task_runner.resource_limiter.PSUTIL_AVAILABLE', True):
-            # Mock memory usage
-            mock_process = Mock()
-            mock_process.memory_info.return_value.rss = 600 * 1024 * 1024  # 600MB
-            mock_psutil.Process.return_value = mock_process
-            # Mock NoSuchProcess exception
-            mock_psutil.NoSuchProcess = Exception
+    async def test_cpu_limit_docker(self, docker_config):
+        """Test CPU limit in Docker."""
+        with patch('docker.from_env') as mock_docker:
+            mock_client = Mock()
+            mock_docker.return_value = mock_client
             
-            enforcer = ResourceLimitEnforcer(resource_limits)
+            mock_container = Mock()
+            mock_client.containers.run.return_value = mock_container
             
-            with pytest.raises(ResourceLimitError):
-                await enforcer.check_memory_usage()
+            # Create runner
+            runner = DockerTaskRunner(docker_config)
+            
+            # Check Docker run arguments
+            await runner.run("print('test')", {})
+            
+            # Verify CPU limit was set
+            call_args = mock_client.containers.run.call_args
+            assert 'cpu_period' in call_args[1]
+            assert 'cpu_quota' in call_args[1]
     
     @pytest.mark.asyncio
-    async def test_cpu_limit_enforcement(self, resource_limits):
-        """Test CPU limit enforcement."""
-        with patch('budflow.executor.task_runner.resource_limiter.psutil') as mock_psutil, \
-             patch('budflow.executor.task_runner.resource_limiter.PSUTIL_AVAILABLE', True):
-            # Mock CPU usage
-            mock_process = Mock()
-            mock_process.cpu_percent.return_value = 75.0  # 75%
-            mock_psutil.Process.return_value = mock_process
-            # Mock NoSuchProcess exception
-            mock_psutil.NoSuchProcess = Exception
-            
-            enforcer = ResourceLimitEnforcer(resource_limits)
-            
-            with pytest.raises(ResourceLimitError):
-                await enforcer.check_cpu_usage()
-    
-    def test_execution_time_limit(self, resource_limits):
-        """Test execution time limit."""
-        enforcer = ResourceLimitEnforcer(resource_limits)
+    async def test_memory_limit_process(self, process_config):
+        """Test memory limit in process runner."""
+        if not hasattr(os, 'setrlimit'):
+            pytest.skip("Resource limits not supported on this platform")
         
-        # Start timer
-        enforcer.start_execution()
+        # Create runner
+        runner = ProcessTaskRunner(process_config)
         
-        # Mock time passage
-        with patch('time.time', return_value=time.time() + 31):
-            with pytest.raises(TaskTimeoutError):
-                enforcer.check_execution_time()
+        # Run code that tries to allocate too much memory
+        code = """
+try:
+    data = [0] * (1024 * 1024 * 1024)  # 1GB
+    print("Should not reach here")
+except MemoryError:
+    print('{"error": "memory_exceeded"}')
+"""
+        result = await runner.run(code, {})
+        
+        # Should handle memory error gracefully
+        assert result.output.get("error") == "memory_exceeded"
 
 
-@pytest.mark.unit
-class TestSecuritySandbox:
-    """Test security sandboxing."""
+class TestSecurityFeatures:
+    """Test security features."""
     
-    def test_restricted_python_sandbox(self, security_config):
-        """Test RestrictedPython sandbox."""
-        sandbox = SecuritySandbox(security_config)
+    @pytest.mark.asyncio
+    async def test_network_isolation_docker(self, docker_config):
+        """Test network isolation in Docker."""
+        docker_config.network_mode = "none"
         
-        # Test safe code
-        safe_code = "result = 2 + 2"
-        compiled = sandbox.compile_restricted(safe_code)
-        assert compiled is not None
-        
-        # Test unsafe code (should raise)
-        unsafe_code = "__import__('os').system('ls')"
-        with pytest.raises(SecurityViolationError):
-            sandbox.compile_restricted(unsafe_code)
+        with patch('docker.from_env') as mock_docker:
+            mock_client = Mock()
+            mock_docker.return_value = mock_client
+            
+            mock_container = Mock()
+            mock_client.containers.run.return_value = mock_container
+            
+            # Create runner
+            runner = DockerTaskRunner(docker_config)
+            
+            # Run code
+            await runner.run("print('test')", {})
+            
+            # Verify network mode
+            call_args = mock_client.containers.run.call_args
+            assert call_args[1]['network_mode'] == 'none'
     
-    def test_module_access_control(self, security_config):
-        """Test module access control."""
-        sandbox = SecuritySandbox(security_config)
+    @pytest.mark.asyncio
+    async def test_user_isolation_docker(self, docker_config):
+        """Test user isolation in Docker."""
+        docker_config.user = "nobody"
         
-        # Test allowed module
-        assert sandbox.is_module_allowed("json")
-        assert sandbox.is_module_allowed("datetime")
-        
-        # Test disallowed module
-        assert not sandbox.is_module_allowed("os")
-        assert not sandbox.is_module_allowed("subprocess")
+        with patch('docker.from_env') as mock_docker:
+            mock_client = Mock()
+            mock_docker.return_value = mock_client
+            
+            mock_container = Mock()
+            mock_client.containers.run.return_value = mock_container
+            
+            # Create runner
+            runner = DockerTaskRunner(docker_config)
+            
+            # Run code
+            await runner.run("print('test')", {})
+            
+            # Verify user
+            call_args = mock_client.containers.run.call_args
+            assert call_args[1]['user'] == 'nobody'
     
-    def test_code_analysis(self, security_config):
-        """Test static code analysis."""
-        analyzer = CodeAnalyzer(security_config)
+    @pytest.mark.asyncio
+    async def test_code_injection_prevention(self, process_config):
+        """Test code injection prevention."""
+        # Create runner
+        runner = ProcessTaskRunner(process_config)
         
-        # Analyze code with imports
+        # Try code injection
+        malicious_input = {
+            "data": '"; import os; os.system("rm -rf /"); "'
+        }
+        
         code = """
 import json
-from datetime import datetime
-
-data = json.dumps({"time": str(datetime.now())})
-result = len(data)
-        """
+import os
+data = json.loads(os.environ.get('INPUT_DATA', '{}'))
+print(json.dumps({"received": data}))
+"""
+        result = await runner.run(code, malicious_input)
         
-        analysis = analyzer.analyze(code)
-        assert "json" in analysis.imports
-        assert "datetime" in analysis.imports
-        assert len(analysis.accessed_variables) > 0
-
-
-@pytest.mark.unit
-class TestTaskRunnerProcess:
-    """Test TaskRunnerProcess functionality."""
-    
-    @pytest.mark.asyncio
-    async def test_process_initialization(self, task_runner_config):
-        """Test task runner process initialization."""
-        with patch('budflow.executor.task_runner.process.Process') as MockProcess:
-            mock_process = Mock()
-            MockProcess.return_value = mock_process
-            
-            runner = TaskRunnerProcess(
-                runner_id="runner-1",
-                config=task_runner_config,
-            )
-            
-            await runner.start()
-            
-            assert runner.is_running
-            MockProcess.assert_called_once()
-            mock_process.start.assert_called_once()
-    
-    @pytest.mark.asyncio
-    async def test_task_execution(self, task_runner_config):
-        """Test task execution in runner process."""
-        runner = TaskRunnerProcess(
-            runner_id="runner-1",
-            config=task_runner_config,
-        )
-        
-        # Mock IPC
-        mock_queue = AsyncMock()
-        runner._task_queue = mock_queue
-        runner._result_queue = mock_queue
-        
-        # Test simple task
-        request = TaskRequest(
-            task_id="task-123",
-            code="result = 2 + 2",
-            context={},
-        )
-        
-        # Mock execution
-        with patch.object(runner, '_execute_code') as mock_execute:
-            mock_execute.return_value = 4
-            
-            result = await runner.execute_task(request)
-            
-            assert result.status == TaskStatus.COMPLETED
-            assert result.result == 4
-            mock_execute.assert_called_once()
-    
-    @pytest.mark.asyncio
-    async def test_task_timeout(self, task_runner_config):
-        """Test task timeout handling."""
-        runner = TaskRunnerProcess(
-            runner_id="runner-1",
-            config=task_runner_config,
-        )
-        
-        request = TaskRequest(
-            task_id="task-123",
-            code="import time; time.sleep(5); result = 1",
-            context={},
-            timeout=1,  # 1 second timeout
-        )
-        
-        # Mock slow execution
-        with patch.object(runner, '_execute_code') as mock_execute:
-            async def slow_execution(*args):
-                await asyncio.sleep(2)
-                return 1
-            
-            mock_execute.side_effect = slow_execution
-            
-            result = await runner.execute_task(request)
-            
-            assert result.status == TaskStatus.TIMEOUT
-            assert result.error is not None
-    
-    @pytest.mark.asyncio
-    async def test_heartbeat_monitoring(self, task_runner_config):
-        """Test heartbeat monitoring."""
-        runner = TaskRunnerProcess(
-            runner_id="runner-1",
-            config=task_runner_config,
-        )
-        
-        # Start heartbeat
-        heartbeat_task = asyncio.create_task(runner._heartbeat_loop())
-        
-        # Check heartbeat updates
-        initial_heartbeat = runner.last_heartbeat
-        await asyncio.sleep(0.1)
-        
-        assert runner.last_heartbeat > initial_heartbeat
-        
-        # Cleanup
-        heartbeat_task.cancel()
-        try:
-            await heartbeat_task
-        except asyncio.CancelledError:
-            pass
-    
-    @pytest.mark.asyncio
-    async def test_graceful_shutdown(self, task_runner_config):
-        """Test graceful shutdown."""
-        with patch('budflow.executor.task_runner.process.Process') as MockProcess:
-            mock_process = Mock()
-            mock_process.is_alive.return_value = True
-            MockProcess.return_value = mock_process
-            
-            runner = TaskRunnerProcess(
-                runner_id="runner-1",
-                config=task_runner_config,
-            )
-            
-            await runner.start()
-            
-            # Add mock running task
-            runner._running_tasks.add("task-123")
-            
-            # Shutdown
-            await runner.shutdown(timeout=5)
-            
-            assert not runner.is_running
-            mock_process.terminate.assert_called()
+        # Should safely handle malicious input
+        assert result.success is True
+        assert result.output["received"]["data"] == malicious_input["data"]
 
 
-@pytest.mark.unit
-class TestTaskBroker:
-    """Test TaskBroker functionality."""
-    
-    @pytest.mark.asyncio
-    async def test_broker_initialization(self, task_runner_config):
-        """Test task broker initialization."""
-        broker = TaskBroker(config=task_runner_config)
-        
-        await broker.start()
-        
-        assert broker.is_running
-        assert len(broker._runners) == 0
-        assert len(broker._pending_requests) == 0
-        assert len(broker._active_offers) == 0
-    
-    @pytest.mark.asyncio
-    async def test_runner_registration(self, task_runner_config):
-        """Test runner registration with broker."""
-        broker = TaskBroker(config=task_runner_config)
-        await broker.start()
-        
-        # Register runner
-        runner_id = await broker.register_runner()
-        
-        assert runner_id is not None
-        assert runner_id in broker._runners
-        assert broker._runners[runner_id].is_running
-    
-    @pytest.mark.asyncio
-    async def test_task_offer_matching(self, task_runner_config):
-        """Test task offer and request matching."""
-        broker = TaskBroker(config=task_runner_config)
-        await broker.start()
-        
-        # Register runner and create offer
-        runner_id = await broker.register_runner()
-        offer = TaskOffer(
-            offer_id="offer-123",
-            runner_id=runner_id,
-            valid_until=datetime.now(timezone.utc) + timedelta(seconds=30),
-        )
-        
-        await broker.submit_offer(offer)
-        
-        # Submit task request
-        request = TaskRequest(
-            task_id="task-123",
-            code="result = 2 + 2",
-            context={},
-        )
-        
-        # Should match immediately
-        assigned = await broker.submit_task(request)
-        
-        assert assigned
-        assert offer.offer_id not in broker._active_offers
-        assert request.task_id not in broker._pending_requests
-    
-    @pytest.mark.asyncio
-    async def test_load_balancing(self, task_runner_config):
-        """Test load balancing across multiple runners."""
-        broker = TaskBroker(config=task_runner_config)
-        await broker.start()
-        
-        # Register multiple runners
-        runner1 = await broker.register_runner()
-        runner2 = await broker.register_runner()
-        
-        # Track task assignments
-        assignments = {runner1: 0, runner2: 0}
-        
-        # Submit multiple tasks
-        for i in range(10):
-            request = TaskRequest(
-                task_id=f"task-{i}",
-                code=f"result = {i}",
-                context={},
-            )
-            
-            # Mock offer creation for each runner
-            for runner_id in [runner1, runner2]:
-                offer = TaskOffer(
-                    offer_id=f"offer-{runner_id}-{i}",
-                    runner_id=runner_id,
-                    valid_until=datetime.now(timezone.utc) + timedelta(seconds=30),
-                )
-                await broker.submit_offer(offer)
-            
-            await broker.submit_task(request)
-        
-        # Check distribution (should be roughly balanced)
-        # Note: Actual implementation would track assignments
-        # This is a simplified test
-        assert len(broker._pending_requests) == 0
-    
-    @pytest.mark.asyncio
-    async def test_runner_failure_recovery(self, task_runner_config):
-        """Test recovery from runner failure."""
-        broker = TaskBroker(config=task_runner_config)
-        await broker.start()
-        
-        # Register runner
-        runner_id = await broker.register_runner()
-        runner = broker._runners[runner_id]
-        
-        # Simulate runner crash
-        runner.is_running = False
-        runner.last_heartbeat = datetime.now(timezone.utc) - timedelta(minutes=5)
-        
-        # Health check should detect and restart
-        await broker._health_check_loop_once()
-        
-        # Runner should be restarted
-        assert broker._runners[runner_id].is_running
-
-
-@pytest.mark.unit
-class TestTaskRunner:
-    """Test main TaskRunner interface."""
-    
-    @pytest.mark.asyncio
-    async def test_task_runner_initialization(self, task_runner_config):
-        """Test task runner initialization."""
-        runner = TaskRunner(config=task_runner_config)
-        
-        await runner.start()
-        
-        assert runner.is_running
-        assert runner.broker is not None
-        assert runner.broker.is_running
-    
-    @pytest.mark.asyncio
-    async def test_execute_code(self, task_runner_config):
-        """Test code execution through task runner."""
-        runner = TaskRunner(config=task_runner_config)
-        await runner.start()
-        
-        # Execute simple code
-        result = await runner.execute(
-            code="result = 2 + 2",
-            context={},
-            timeout=10,
-        )
-        
-        assert result["success"] is True
-        assert result["result"] == 4
-        assert result["error"] is None
-    
-    @pytest.mark.asyncio
-    async def test_execute_with_context(self, task_runner_config):
-        """Test code execution with context."""
-        runner = TaskRunner(config=task_runner_config)
-        await runner.start()
-        
-        # Execute code with context
-        result = await runner.execute(
-            code="""
-items = context['items']
-result = sum(items) * multiplier
-            """,
-            context={
-                "items": [1, 2, 3, 4, 5],
-                "multiplier": 2,
-            },
-            timeout=10,
-        )
-        
-        assert result["success"] is True
-        assert result["result"] == 30  # sum([1,2,3,4,5]) * 2
-    
-    @pytest.mark.asyncio
-    async def test_execute_with_imports(self, task_runner_config):
-        """Test code execution with allowed imports."""
-        runner = TaskRunner(config=task_runner_config)
-        await runner.start()
-        
-        # Execute code with imports
-        result = await runner.execute(
-            code="""
-import json
-import datetime
-
-data = {"timestamp": str(datetime.datetime.now())}
-result = json.dumps(data)
-            """,
-            context={},
-            timeout=10,
-        )
-        
-        assert result["success"] is True
-        assert isinstance(result["result"], str)
-        assert "timestamp" in json.loads(result["result"])
-    
-    @pytest.mark.asyncio
-    async def test_execute_with_error(self, task_runner_config):
-        """Test code execution with error."""
-        runner = TaskRunner(config=task_runner_config)
-        await runner.start()
-        
-        # Execute code that raises error
-        result = await runner.execute(
-            code="result = 1 / 0",
-            context={},
-            timeout=10,
-        )
-        
-        assert result["success"] is False
-        assert result["error"] is not None
-        assert "ZeroDivisionError" in result["error"]
-    
-    @pytest.mark.asyncio
-    async def test_execute_with_security_violation(self, task_runner_config):
-        """Test code execution with security violation."""
-        runner = TaskRunner(config=task_runner_config)
-        await runner.start()
-        
-        # Try to execute unsafe code
-        result = await runner.execute(
-            code="import os; result = os.listdir('/')",
-            context={},
-            timeout=10,
-        )
-        
-        assert result["success"] is False
-        assert result["error"] is not None
-        assert "security" in result["error"].lower() or "not allowed" in result["error"].lower()
-    
-    @pytest.mark.asyncio
-    async def test_concurrent_execution(self, task_runner_config):
-        """Test concurrent task execution."""
-        runner = TaskRunner(config=task_runner_config)
-        await runner.start()
-        
-        # Execute multiple tasks concurrently
-        tasks = []
-        for i in range(5):
-            task = runner.execute(
-                code=f"result = {i} * {i}",
-                context={},
-                timeout=10,
-            )
-            tasks.append(task)
-        
-        results = await asyncio.gather(*tasks)
-        
-        # All should succeed
-        for i, result in enumerate(results):
-            assert result["success"] is True
-            assert result["result"] == i * i
-    
-    @pytest.mark.asyncio
-    async def test_graceful_shutdown(self, task_runner_config):
-        """Test graceful shutdown of task runner."""
-        runner = TaskRunner(config=task_runner_config)
-        await runner.start()
-        
-        # Submit a long-running task
-        task = asyncio.create_task(
-            runner.execute(
-                code="import time; time.sleep(2); result = 42",
-                context={},
-                timeout=10,
-            )
-        )
-        
-        # Give it time to start
-        await asyncio.sleep(0.1)
-        
-        # Shutdown runner
-        await runner.shutdown(timeout=5)
-        
-        assert not runner.is_running
-        
-        # Task should be cancelled or completed
-        if not task.done():
-            task.cancel()
-
-
-@pytest.mark.integration
-class TestTaskRunnerIntegration:
+class TestIntegration:
     """Integration tests for task runner."""
     
     @pytest.mark.asyncio
-    async def test_real_process_execution(self):
-        """Test real process execution (requires working environment)."""
-        config = TaskRunnerConfig(
-            mode=TaskRunnerMode.INTERNAL,
-            max_concurrency=1,
-            task_timeout=10,
-            enable_sandboxing=True,
-        )
-        
-        runner = TaskRunner(config=config)
-        await runner.start()
-        
-        try:
-            # Test mathematical computation
-            result = await runner.execute(
-                code="""
-# Calculate fibonacci
-def fib(n):
-    if n <= 1:
-        return n
-    return fib(n-1) + fib(n-2)
+    async def test_workflow_code_execution(self, docker_config):
+        """Test executing code from workflow context."""
+        with patch('docker.from_env') as mock_docker:
+            # Mock Docker client
+            mock_client = Mock()
+            mock_docker.return_value = mock_client
+            
+            # Mock successful execution
+            mock_container = Mock()
+            mock_container.logs.return_value = b'{"processed": true, "count": 5}'
+            mock_container.wait.return_value = {"StatusCode": 0}
+            mock_container.attrs = {"State": {"ExitCode": 0}}
+            
+            mock_client.containers.run.return_value = mock_container
+            
+            # Create runner
+            runner = DockerTaskRunner(docker_config)
+            
+            # Workflow code that processes data
+            code = """
+import json
 
-result = [fib(i) for i in range(10)]
-                """,
-                context={},
-                timeout=5,
-            )
+# Get input data
+input_data = json.loads(INPUT_DATA)
+
+# Process items
+processed_items = []
+for item in input_data.get("items", []):
+    processed_items.append({
+        "id": item["id"],
+        "processed": True
+    })
+
+# Return result
+result = {
+    "processed": True,
+    "count": len(processed_items)
+}
+print(json.dumps(result))
+"""
             
-            assert result["success"] is True
-            assert result["result"] == [0, 1, 1, 2, 3, 5, 8, 13, 21, 34]
+            # Input from previous node
+            input_data = {
+                "items": [
+                    {"id": 1, "name": "Item 1"},
+                    {"id": 2, "name": "Item 2"},
+                    {"id": 3, "name": "Item 3"},
+                    {"id": 4, "name": "Item 4"},
+                    {"id": 5, "name": "Item 5"},
+                ]
+            }
             
-        finally:
-            await runner.shutdown()
+            result = await runner.run(code, input_data)
+            
+            assert result.success is True
+            assert result.output["processed"] is True
+            assert result.output["count"] == 5
     
     @pytest.mark.asyncio
-    async def test_resource_limit_enforcement(self):
-        """Test resource limit enforcement in real execution."""
-        config = TaskRunnerConfig(
-            mode=TaskRunnerMode.INTERNAL,
-            max_memory_mb=128,  # Low memory limit
-            task_timeout=5,
-            enable_sandboxing=True,
-        )
+    async def test_error_propagation(self, process_config):
+        """Test error propagation to workflow."""
+        # Create runner
+        runner = ProcessTaskRunner(process_config)
         
-        runner = TaskRunner(config=config)
-        await runner.start()
+        # Code with business logic error
+        code = """
+import json
+
+def process_order(order_data):
+    if order_data["amount"] < 0:
+        raise ValueError("Order amount cannot be negative")
+    return {"status": "processed"}
+
+try:
+    input_data = {"amount": -100}
+    result = process_order(input_data)
+    print(json.dumps(result))
+except Exception as e:
+    error_result = {
+        "error": str(e),
+        "type": type(e).__name__
+    }
+    print(json.dumps(error_result))
+"""
         
-        try:
-            # Try to allocate too much memory
-            result = await runner.execute(
-                code="""
-# Try to allocate large list
-large_list = []
-for i in range(10000000):
-    large_list.append("x" * 1000)
-result = len(large_list)
-                """,
-                context={},
-                timeout=5,
-            )
-            
-            # Should fail due to memory limit
-            assert result["success"] is False
-            assert "memory" in result["error"].lower() or "resource" in result["error"].lower()
-            
-        finally:
-            await runner.shutdown()
+        result = await runner.run(code, {})
+        
+        assert result.success is True  # Code ran successfully
+        assert "error" in result.output
+        assert result.output["error"] == "Order amount cannot be negative"
+        assert result.output["type"] == "ValueError"

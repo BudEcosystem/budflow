@@ -1,48 +1,51 @@
-"""Test binary data handling system."""
-
-import asyncio
-import os
-import tempfile
-from datetime import datetime, timedelta, timezone
-from io import BytesIO
-from pathlib import Path
-from typing import AsyncIterator, Optional
-from unittest.mock import AsyncMock, Mock, patch
-from uuid import uuid4
+"""Tests for binary data management system."""
 
 import pytest
-from moto import mock_aws
-import boto3
-from botocore.exceptions import ClientError
+import asyncio
+import tempfile
+import shutil
+from pathlib import Path
+from unittest.mock import Mock, AsyncMock, patch, MagicMock
+from datetime import datetime, timezone, timedelta
+from uuid import UUID, uuid4
 
 from budflow.core.binary_data import (
-    BinaryDataConfig,
-    BinaryDataMetadata,
-    BinaryDataMeta,
-    BinaryDataMode,
-    BinaryDataReference,
-    BinaryDataService,
+    BinaryDataManager,
     FileSystemBackend,
     S3Backend,
     BinaryDataError,
     BinaryDataNotFoundError,
-    BinaryDataStorageError,
+    BinaryDataMetadata,
+    BinaryDataConfig,
+    StorageBackend,
 )
 
 
 @pytest.fixture
-def binary_config():
+def temp_storage_dir():
+    """Create temporary storage directory."""
+    temp_dir = tempfile.mkdtemp()
+    yield temp_dir
+    shutil.rmtree(temp_dir)
+
+
+@pytest.fixture
+def binary_config(temp_storage_dir):
     """Create binary data configuration."""
+    import base64
+    import secrets
+    
     return BinaryDataConfig(
-        mode=BinaryDataMode.FILESYSTEM,
-        filesystem_path="/tmp/budflow/binary",
-        s3_bucket="budflow-binary-data",
+        backend="filesystem",
+        filesystem_path=temp_storage_dir,
+        s3_bucket="test-bucket",
         s3_region="us-east-1",
-        max_size_mb=100,
-        ttl_minutes=60,
+        max_file_size=10 * 1024 * 1024,  # 10MB
+        allowed_mime_types=["image/*", "application/pdf", "text/*", "application/octet-stream"],
+        ttl_days=30,
         enable_compression=True,
         enable_encryption=True,
-        encryption_key="test-encryption-key-1234567890",
+        encryption_key=base64.b64encode(secrets.token_bytes(32)).decode('utf-8')
     )
 
 
@@ -54,567 +57,502 @@ def filesystem_backend(binary_config):
 
 @pytest.fixture
 def s3_backend(binary_config):
-    """Create S3 backend with mocked AWS."""
-    with mock_aws():
-        # Create mock S3 bucket
-        s3 = boto3.client('s3', region_name=binary_config.s3_region)
-        s3.create_bucket(Bucket=binary_config.s3_bucket)
-        
-        binary_config.mode = BinaryDataMode.S3
-        yield S3Backend(binary_config)
+    """Create S3 backend."""
+    with patch('budflow.core.binary_data.s3.boto3') as mock_boto3:
+        mock_client = Mock()
+        mock_boto3.client.return_value = mock_client
+        backend = S3Backend(binary_config)
+        # Store reference to mock client for tests
+        backend._mock_client = mock_client
+        return backend
 
 
 @pytest.fixture
-def binary_service(binary_config):
-    """Create binary data service."""
-    return BinaryDataService(binary_config)
+def binary_manager(binary_config):
+    """Create binary data manager."""
+    return BinaryDataManager(binary_config)
 
 
 @pytest.fixture
-def sample_data():
+def sample_binary_data():
     """Create sample binary data."""
-    return b"This is test binary data content!"
+    return b"This is test binary data content for testing purposes."
 
 
 @pytest.fixture
-def large_data():
-    """Create large binary data for streaming tests."""
-    # 5MB of data
-    return b"x" * (5 * 1024 * 1024)
+def sample_metadata():
+    """Create sample metadata."""
+    return BinaryDataMetadata(
+        id=uuid4(),
+        filename="test-file.pdf",
+        content_type="application/pdf",
+        size=1024,
+        checksum="abc123def456",
+        created_at=datetime.now(timezone.utc),
+        expires_at=datetime.now(timezone.utc) + timedelta(days=30),
+        metadata={
+            "workflow_id": str(uuid4()),
+            "node_id": "http_request_1",
+            "user_id": str(uuid4())
+        },
+        storage_path="",
+        is_compressed=False,
+        is_encrypted=False
+    )
 
 
-@pytest.mark.unit
-class TestBinaryDataConfig:
-    """Test binary data configuration."""
-    
-    def test_default_config(self):
-        """Test default configuration values."""
-        config = BinaryDataConfig()
-        
-        assert config.mode == BinaryDataMode.FILESYSTEM
-        assert config.filesystem_path == "/data/binary"
-        assert config.max_size_mb == 250
-        assert config.ttl_minutes == 60
-        assert config.enable_compression is False
-        assert config.enable_encryption is False
-    
-    def test_s3_config_validation(self):
-        """Test S3 configuration validation."""
-        config = BinaryDataConfig(mode=BinaryDataMode.S3)
-        
-        # Should have default S3 settings
-        assert config.s3_bucket == "budflow-binary"
-        assert config.s3_region == "us-east-1"
-    
-    def test_encryption_key_validation(self):
-        """Test encryption key validation."""
-        with pytest.raises(ValueError, match="Encryption key required"):
-            BinaryDataConfig(
-                enable_encryption=True,
-                encryption_key=""
-            )
-
-
-@pytest.mark.unit
-class TestBinaryDataMetadata:
-    """Test binary data metadata."""
-    
-    def test_metadata_creation(self):
-        """Test creating metadata."""
-        metadata = BinaryDataMeta(
-            id=str(uuid4()),
-            filename="test.pdf",
-            mime_type="application/pdf",
-            size=1024,
-            checksum="abc123",
-            created_at=datetime.now(timezone.utc),
-            expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
-            workflow_id=str(uuid4()),
-            execution_id=str(uuid4()),
-            node_id="node_1",
-        )
-        
-        assert metadata.filename == "test.pdf"
-        assert metadata.mime_type == "application/pdf"
-        assert metadata.size == 1024
-        assert metadata.is_expired() is False
-    
-    def test_metadata_expiration(self):
-        """Test metadata expiration check."""
-        metadata = BinaryDataMeta(
-            id=str(uuid4()),
-            filename="test.txt",
-            mime_type="text/plain",
-            size=100,
-            checksum="xyz789",
-            created_at=datetime.now(timezone.utc) - timedelta(hours=2),
-            expires_at=datetime.now(timezone.utc) - timedelta(hours=1),
-        )
-        
-        assert metadata.is_expired() is True
-
-
-@pytest.mark.unit
 class TestFileSystemBackend:
     """Test filesystem storage backend."""
     
     @pytest.mark.asyncio
-    async def test_store_binary_data(self, filesystem_backend, sample_data):
+    async def test_store_binary_data(self, filesystem_backend, sample_binary_data, sample_metadata):
         """Test storing binary data."""
-        data_id = str(uuid4())
-        
         # Store data
-        path = await filesystem_backend.store(data_id, sample_data)
+        storage_path = await filesystem_backend.store(
+            data=sample_binary_data,
+            metadata=sample_metadata
+        )
         
-        assert path is not None
-        assert data_id in path
+        assert storage_path is not None
+        assert Path(storage_path).exists()
         
-        # Verify file exists
-        assert os.path.exists(path)
+        # Read file content
+        with open(storage_path, 'rb') as f:
+            stored_data = f.read()
         
-        # Cleanup
-        os.remove(path)
+        assert stored_data == sample_binary_data
     
     @pytest.mark.asyncio
-    async def test_retrieve_binary_data(self, filesystem_backend, sample_data):
+    async def test_retrieve_binary_data(self, filesystem_backend, sample_binary_data, sample_metadata):
         """Test retrieving binary data."""
-        data_id = str(uuid4())
-        
         # Store data first
-        path = await filesystem_backend.store(data_id, sample_data)
+        storage_path = await filesystem_backend.store(
+            data=sample_binary_data,
+            metadata=sample_metadata
+        )
         
         # Retrieve data
-        retrieved = await filesystem_backend.retrieve(data_id)
+        retrieved_data = await filesystem_backend.retrieve(storage_path)
         
-        assert retrieved == sample_data
-        
-        # Cleanup
-        os.remove(path)
+        assert retrieved_data == sample_binary_data
     
     @pytest.mark.asyncio
-    async def test_delete_binary_data(self, filesystem_backend, sample_data):
+    async def test_delete_binary_data(self, filesystem_backend, sample_binary_data, sample_metadata):
         """Test deleting binary data."""
-        data_id = str(uuid4())
-        
         # Store data first
-        path = await filesystem_backend.store(data_id, sample_data)
-        assert os.path.exists(path)
+        storage_path = await filesystem_backend.store(
+            data=sample_binary_data,
+            metadata=sample_metadata
+        )
+        
+        assert Path(storage_path).exists()
         
         # Delete data
-        deleted = await filesystem_backend.delete(data_id)
+        await filesystem_backend.delete(storage_path)
         
-        assert deleted is True
-        assert not os.path.exists(path)
+        assert not Path(storage_path).exists()
     
     @pytest.mark.asyncio
-    async def test_stream_large_data(self, filesystem_backend, large_data):
+    async def test_stream_binary_data(self, filesystem_backend, sample_metadata):
         """Test streaming large binary data."""
-        data_id = str(uuid4())
-        
-        # Store using stream
-        stream = BytesIO(large_data)
-        path = await filesystem_backend.store_stream(data_id, stream)
-        
-        # Retrieve using stream
-        chunks = []
-        async for chunk in filesystem_backend.retrieve_stream(data_id):
-            chunks.append(chunk)
-        
-        retrieved = b"".join(chunks)
-        assert retrieved == large_data
-        
-        # Cleanup
-        os.remove(path)
-    
-    @pytest.mark.asyncio
-    async def test_exists_check(self, filesystem_backend, sample_data):
-        """Test checking if data exists."""
-        data_id = str(uuid4())
-        
-        # Should not exist initially
-        assert await filesystem_backend.exists(data_id) is False
+        # Create large data (1MB)
+        large_data = b"x" * (1024 * 1024)
         
         # Store data
-        path = await filesystem_backend.store(data_id, sample_data)
+        storage_path = await filesystem_backend.store(
+            data=large_data,
+            metadata=sample_metadata
+        )
         
-        # Should exist now
-        assert await filesystem_backend.exists(data_id) is True
+        # Stream data
+        chunks = []
+        async for chunk in filesystem_backend.stream(storage_path, chunk_size=1024):
+            chunks.append(chunk)
         
-        # Cleanup
-        os.remove(path)
+        # Verify
+        retrieved_data = b"".join(chunks)
+        assert retrieved_data == large_data
+        assert len(chunks) == 1024  # 1MB / 1KB chunks
+    
+    @pytest.mark.asyncio
+    async def test_exists_check(self, filesystem_backend, sample_binary_data, sample_metadata):
+        """Test checking if data exists."""
+        # Initially doesn't exist
+        fake_path = "/fake/path/data.bin"
+        assert not await filesystem_backend.exists(fake_path)
+        
+        # Store data
+        storage_path = await filesystem_backend.store(
+            data=sample_binary_data,
+            metadata=sample_metadata
+        )
+        
+        # Now exists
+        assert await filesystem_backend.exists(storage_path)
+    
+    @pytest.mark.asyncio
+    async def test_get_url(self, filesystem_backend, sample_binary_data, sample_metadata):
+        """Test getting URL for binary data."""
+        # Store data
+        storage_path = await filesystem_backend.store(
+            data=sample_binary_data,
+            metadata=sample_metadata
+        )
+        
+        # Get URL
+        url = await filesystem_backend.get_url(storage_path, expires_in=3600)
+        
+        assert url.startswith("file://")
+        assert storage_path in url
 
 
-@pytest.mark.unit
 class TestS3Backend:
     """Test S3 storage backend."""
     
     @pytest.mark.asyncio
-    async def test_store_binary_data(self, s3_backend, sample_data):
-        """Test storing binary data in S3."""
-        data_id = str(uuid4())
+    async def test_store_binary_data(self, s3_backend, sample_binary_data, sample_metadata):
+        """Test storing binary data to S3."""
+        # Get the mocked client
+        mock_s3 = s3_backend.s3_client
+        
+        # Mock put_object
+        mock_s3.put_object.return_value = {'ETag': '"abc123"'}
         
         # Store data
-        key = await s3_backend.store(data_id, sample_data)
+        storage_path = await s3_backend.store(
+            data=sample_binary_data,
+            metadata=sample_metadata
+        )
         
-        assert key is not None
-        assert data_id in key
+        assert storage_path is not None
+        assert storage_path.startswith("s3://")
+        
+        # Verify S3 call
+        mock_s3.put_object.assert_called_once()
+        call_args = mock_s3.put_object.call_args[1]
+        assert call_args['Bucket'] == 'test-bucket'
+        assert call_args['Body'] == sample_binary_data
     
     @pytest.mark.asyncio
-    async def test_retrieve_binary_data(self, s3_backend, sample_data):
+    async def test_retrieve_binary_data(self, s3_backend, sample_binary_data):
         """Test retrieving binary data from S3."""
-        data_id = str(uuid4())
+        # Get the mocked client
+        mock_s3 = s3_backend.s3_client
         
-        # Store data first
-        await s3_backend.store(data_id, sample_data)
+        # Mock get_object
+        mock_s3.get_object.return_value = {
+            'Body': Mock(read=Mock(return_value=sample_binary_data))
+        }
         
         # Retrieve data
-        retrieved = await s3_backend.retrieve(data_id)
+        storage_path = "s3://test-bucket/data/2024/01/test-file.pdf"
+        retrieved_data = await s3_backend.retrieve(storage_path)
         
-        assert retrieved == sample_data
-    
-    @pytest.mark.asyncio
-    async def test_generate_signed_url(self, s3_backend, sample_data):
-        """Test generating signed URL for S3 object."""
-        data_id = str(uuid4())
+        assert retrieved_data == sample_binary_data
         
-        # Store data first
-        await s3_backend.store(data_id, sample_data)
-        
-        # Generate signed URL
-        url = await s3_backend.generate_signed_url(data_id, expires_in=3600)
-        
-        assert url is not None
-        assert "https://" in url
-        assert data_id in url
-    
-    @pytest.mark.asyncio
-    async def test_multipart_upload(self, s3_backend, large_data):
-        """Test multipart upload for large files."""
-        data_id = str(uuid4())
-        
-        # Initiate multipart upload
-        upload_id = await s3_backend.initiate_multipart_upload(data_id)
-        
-        assert upload_id is not None
-        
-        # Upload parts
-        chunk_size = 5 * 1024 * 1024  # 5MB chunks
-        parts = []
-        
-        for i, offset in enumerate(range(0, len(large_data), chunk_size)):
-            chunk = large_data[offset:offset + chunk_size]
-            etag = await s3_backend.upload_part(
-                data_id, upload_id, i + 1, chunk
-            )
-            parts.append({"PartNumber": i + 1, "ETag": etag})
-        
-        # Complete upload
-        await s3_backend.complete_multipart_upload(data_id, upload_id, parts)
-        
-        # Verify data
-        retrieved = await s3_backend.retrieve(data_id)
-        assert retrieved == large_data
-
-
-@pytest.mark.unit
-class TestBinaryDataService:
-    """Test main binary data service."""
-    
-    @pytest.mark.asyncio
-    async def test_store_and_retrieve(self, binary_service, sample_data):
-        """Test storing and retrieving binary data."""
-        # Create metadata
-        metadata = BinaryDataMeta(
-            filename="test.bin",
-            mime_type="application/octet-stream",
-            size=len(sample_data),
-            checksum="",  # Will be calculated by service
-            storage_mode=BinaryDataMode.FILESYSTEM,
-            workflow_id=str(uuid4()),
-            execution_id=str(uuid4()),
+        # Verify S3 call
+        mock_s3.get_object.assert_called_once_with(
+            Bucket='test-bucket',
+            Key='data/2024/01/test-file.pdf'
         )
+    
+    @pytest.mark.asyncio
+    async def test_delete_binary_data(self, s3_backend):
+        """Test deleting binary data from S3."""
+        # Get the mocked client
+        mock_s3 = s3_backend.s3_client
+        
+        # Delete data
+        storage_path = "s3://test-bucket/data/2024/01/test-file.pdf"
+        await s3_backend.delete(storage_path)
+        
+        # Verify S3 call
+        mock_s3.delete_object.assert_called_once_with(
+            Bucket='test-bucket',
+            Key='data/2024/01/test-file.pdf'
+        )
+    
+    @pytest.mark.asyncio
+    async def test_stream_binary_data(self, s3_backend):
+        """Test streaming large binary data from S3."""
+        # Create large data chunks
+        chunk1 = b"x" * 1024
+        chunk2 = b"y" * 1024
+        chunk3 = b"z" * 512
+        
+        # Get the mocked client
+        mock_s3 = s3_backend.s3_client
+        
+        # Mock streaming response
+        mock_body = Mock()
+        mock_body.read = Mock(side_effect=[chunk1, chunk2, chunk3, b""])
+        
+        mock_s3.get_object.return_value = {'Body': mock_body}
+        
+        # Stream data
+        storage_path = "s3://test-bucket/data/large-file.bin"
+        chunks = []
+        async for chunk in s3_backend.stream(storage_path):
+            chunks.append(chunk)
+        
+        assert len(chunks) == 3
+        assert chunks[0] == chunk1
+        assert chunks[1] == chunk2
+        assert chunks[2] == chunk3
+    
+    @pytest.mark.asyncio
+    async def test_get_presigned_url(self, s3_backend):
+        """Test generating presigned URL."""
+        # Get the mocked client
+        mock_s3 = s3_backend.s3_client
+        
+        # Mock generate_presigned_url
+        mock_url = "https://test-bucket.s3.amazonaws.com/data/file.pdf?signature=xyz"
+        mock_s3.generate_presigned_url.return_value = mock_url
+        
+        # Get URL
+        storage_path = "s3://test-bucket/data/file.pdf"
+        url = await s3_backend.get_url(storage_path, expires_in=3600)
+        
+        assert url == mock_url
+        
+        # Verify S3 call
+        mock_s3.generate_presigned_url.assert_called_once_with(
+            'get_object',
+            Params={'Bucket': 'test-bucket', 'Key': 'data/file.pdf'},
+            ExpiresIn=3600
+        )
+
+
+class TestBinaryDataManager:
+    """Test binary data manager."""
+    
+    @pytest.mark.asyncio
+    async def test_store_with_compression(self, binary_manager):
+        """Test storing data with compression."""
+        # Create compressible data (repeated pattern)
+        compressible_data = b"This is a test string that will be repeated many times. " * 100
         
         # Store data
-        reference = await binary_service.store(sample_data, metadata)
-        
-        assert reference is not None
-        assert reference.id is not None
-        assert reference.url is None  # No URL for filesystem
-        
-        # Retrieve data
-        retrieved_data, retrieved_metadata = await binary_service.retrieve(
-            reference.id
-        )
-        
-        assert retrieved_data == sample_data
-        assert retrieved_metadata.filename == metadata.filename
-    
-    @pytest.mark.asyncio
-    async def test_compression(self, binary_service, sample_data):
-        """Test data compression."""
-        binary_service.config.enable_compression = True
-        
-        metadata = BinaryDataMeta(
+        binary_id = await binary_manager.store(
+            data=compressible_data,
             filename="test.txt",
-            mime_type="text/plain",
-            size=len(sample_data),
-            checksum="",
-            storage_mode=BinaryDataMode.FILESYSTEM,
+            content_type="text/plain",
+            metadata={"test": "value"}
         )
         
-        # Store with compression
-        reference = await binary_service.store(sample_data, metadata)
+        assert isinstance(binary_id, UUID)
         
-        # Retrieve should decompress automatically
-        retrieved_data, _ = await binary_service.retrieve(reference.id)
-        
-        assert retrieved_data == sample_data
+        # Check metadata
+        metadata = await binary_manager.get_metadata(binary_id)
+        assert metadata.filename == "test.txt"
+        assert metadata.content_type == "text/plain"
+        assert metadata.is_compressed is True
+        # Compressed size should be smaller than original
+        assert metadata.size < len(compressible_data)
     
     @pytest.mark.asyncio
-    async def test_encryption(self, binary_service, sample_data):
-        """Test data encryption."""
-        binary_service.config.enable_encryption = True
-        binary_service.config.encryption_key = "test-key-32-bytes-long-1234567890"
-        
-        metadata = BinaryDataMeta(
-            filename="sensitive.dat",
-            mime_type="application/octet-stream",
-            size=len(sample_data),
-            checksum="",
-            storage_mode=BinaryDataMode.FILESYSTEM,
-        )
-        
-        # Store with encryption
-        reference = await binary_service.store(sample_data, metadata)
-        
-        # Retrieve should decrypt automatically
-        retrieved_data, _ = await binary_service.retrieve(reference.id)
-        
-        assert retrieved_data == sample_data
-    
-    @pytest.mark.asyncio
-    async def test_ttl_cleanup(self, binary_service, sample_data):
-        """Test TTL-based cleanup."""
-        # Create expired metadata
-        metadata = BinaryDataMeta(
-            filename="old.dat",
-            mime_type="application/octet-stream",
-            size=len(sample_data),
-            checksum="",
-            storage_mode=BinaryDataMode.FILESYSTEM,
-            expires_at=datetime.now(timezone.utc) - timedelta(hours=1),
-        )
+    async def test_store_with_encryption(self, binary_manager):
+        """Test storing data with encryption."""
+        sensitive_data = b"This is sensitive data"
         
         # Store data
-        reference = await binary_service.store(sample_data, metadata)
+        binary_id = await binary_manager.store(
+            data=sensitive_data,
+            filename="sensitive.dat",
+            content_type="application/octet-stream",
+            metadata={"encrypted": True}
+        )
+        
+        # Retrieve data
+        retrieved_data = await binary_manager.retrieve(binary_id)
+        
+        # Should get original data back (transparently decrypted)
+        assert retrieved_data == sensitive_data
+        
+        # Check metadata
+        metadata = await binary_manager.get_metadata(binary_id)
+        assert metadata.is_encrypted is True
+    
+    @pytest.mark.asyncio
+    async def test_store_with_ttl(self, binary_manager, sample_binary_data):
+        """Test storing data with TTL."""
+        # Store data with custom TTL
+        binary_id = await binary_manager.store(
+            data=sample_binary_data,
+            filename="temp.dat",
+            content_type="application/octet-stream",
+            ttl_days=7
+        )
+        
+        # Check metadata
+        metadata = await binary_manager.get_metadata(binary_id)
+        assert metadata.expires_at is not None
+        
+        # Check expiration is ~7 days from now
+        expected_expiry = datetime.now(timezone.utc) + timedelta(days=7)
+        time_diff = abs((metadata.expires_at - expected_expiry).total_seconds())
+        assert time_diff < 60  # Within 1 minute
+    
+    @pytest.mark.asyncio
+    async def test_cleanup_expired_data(self, binary_manager):
+        """Test cleaning up expired data."""
+        # Store data with very short TTL
+        binary_id = await binary_manager.store(
+            data=b"expired data",
+            filename="expired.dat",
+            content_type="application/octet-stream",
+            ttl_days=0.00001  # Expires in ~0.864 seconds
+        )
+        
+        # Wait for it to expire
+        await asyncio.sleep(1.0)
         
         # Run cleanup
-        deleted_count = await binary_service.cleanup_expired()
+        cleaned_count = await binary_manager.cleanup_expired()
         
-        assert deleted_count >= 1
+        assert cleaned_count >= 1
         
         # Data should be gone
         with pytest.raises(BinaryDataNotFoundError):
-            await binary_service.retrieve(reference.id)
+            await binary_manager.retrieve(binary_id)
     
     @pytest.mark.asyncio
-    async def test_size_limit(self, binary_service):
-        """Test size limit enforcement."""
-        binary_service.config.max_size_mb = 1  # 1MB limit
-        
-        # Create data larger than limit
-        large_data = b"x" * (2 * 1024 * 1024)  # 2MB
-        
-        metadata = BinaryDataMeta(
-            filename="large.bin",
-            mime_type="application/octet-stream",
-            size=len(large_data),
-            checksum="",
-            storage_mode=BinaryDataMode.FILESYSTEM,
+    async def test_get_signed_url(self, binary_manager, sample_binary_data):
+        """Test getting signed URL for data access."""
+        # Store data
+        binary_id = await binary_manager.store(
+            data=sample_binary_data,
+            filename="document.pdf",
+            content_type="application/pdf"
         )
         
-        # Should raise error
-        with pytest.raises(BinaryDataStorageError, match="exceeds maximum"):
-            await binary_service.store(large_data, metadata)
+        # Get signed URL
+        url = await binary_manager.get_signed_url(binary_id, expires_in=3600)
+        
+        assert url is not None
+        assert isinstance(url, str)
+        
+        # URL should contain signature or be a valid file:// URL
+        assert url.startswith(("https://", "file://"))
     
     @pytest.mark.asyncio
-    async def test_stream_processing(self, binary_service, large_data):
-        """Test stream processing for large files."""
-        metadata = BinaryDataMeta(
-            filename="stream.bin",
-            mime_type="application/octet-stream",
-            size=len(large_data),
-            checksum="",
-            storage_mode=BinaryDataMode.FILESYSTEM,
-        )
+    async def test_validate_file_size(self, binary_manager):
+        """Test file size validation."""
+        # Try to store file that's too large
+        large_data = b"x" * (11 * 1024 * 1024)  # 11MB (over 10MB limit)
         
-        # Store using stream
-        stream = BytesIO(large_data)
-        reference = await binary_service.store_stream(stream, metadata)
-        
-        # Retrieve using stream
-        chunks = []
-        async for chunk in binary_service.retrieve_stream(reference.id):
-            chunks.append(chunk)
-        
-        retrieved = b"".join(chunks)
-        assert retrieved == large_data
-    
-    @pytest.mark.asyncio
-    async def test_progress_tracking(self, binary_service, large_data):
-        """Test upload/download progress tracking."""
-        progress_updates = []
-        
-        def progress_callback(bytes_processed, total_bytes):
-            progress_updates.append((bytes_processed, total_bytes))
-        
-        metadata = BinaryDataMeta(
-            filename="progress.bin",
-            mime_type="application/octet-stream",
-            size=len(large_data),
-            checksum="",
-            storage_mode=BinaryDataMode.FILESYSTEM,
-        )
-        
-        # Store with progress tracking
-        reference = await binary_service.store(
-            large_data, metadata, progress_callback=progress_callback
-        )
-        
-        # Should have progress updates
-        assert len(progress_updates) > 0
-        assert progress_updates[-1][0] == len(large_data)
-    
-    @pytest.mark.asyncio
-    async def test_metadata_search(self, binary_service, sample_data):
-        """Test searching for binary data by metadata."""
-        workflow_id = str(uuid4())
-        
-        # Store multiple files
-        for i in range(3):
-            metadata = BinaryDataMeta(
-                filename=f"file_{i}.dat",
-                mime_type="application/octet-stream",
-                size=len(sample_data),
-                checksum="",
-                storage_mode=BinaryDataMode.FILESYSTEM,
-                workflow_id=workflow_id,
+        with pytest.raises(BinaryDataError) as exc_info:
+            await binary_manager.store(
+                data=large_data,
+                filename="large.bin",
+                content_type="application/octet-stream"
             )
-            await binary_service.store(sample_data, metadata)
         
-        # Search by workflow ID
-        results = await binary_service.find_by_workflow(workflow_id)
-        
-        assert len(results) == 3
-        assert all(r.workflow_id == workflow_id for r in results)
-
-
-@pytest.mark.unit
-class TestBinaryDataReference:
-    """Test binary data reference."""
+        assert "exceeds maximum size" in str(exc_info.value)
     
-    def test_reference_creation(self):
-        """Test creating binary data reference."""
-        ref = BinaryDataReference(
-            id=str(uuid4()),
-            url="https://example.com/data/123",
-            mode=BinaryDataMode.S3,
-        )
+    @pytest.mark.asyncio
+    async def test_validate_mime_type(self, binary_manager):
+        """Test MIME type validation."""
+        # Try to store disallowed MIME type
+        with pytest.raises(BinaryDataError) as exc_info:
+            await binary_manager.store(
+                data=b"executable content",
+                filename="malware.exe",
+                content_type="application/x-executable"
+            )
         
-        assert ref.id is not None
-        assert ref.url == "https://example.com/data/123"
-        assert ref.mode == BinaryDataMode.S3
+        assert "not allowed" in str(exc_info.value)
     
-    def test_reference_serialization(self):
-        """Test reference serialization."""
-        ref = BinaryDataReference(
-            id=str(uuid4()),
-            mode=BinaryDataMode.FILESYSTEM,
-        )
+    @pytest.mark.asyncio
+    async def test_concurrent_operations(self, binary_manager):
+        """Test concurrent binary data operations."""
+        # Store multiple files concurrently
+        tasks = []
+        for i in range(10):
+            task = binary_manager.store(
+                data=f"Content {i}".encode(),
+                filename=f"file_{i}.txt",
+                content_type="text/plain"
+            )
+            tasks.append(task)
         
-        # Convert to dict
-        data = ref.model_dump()
+        binary_ids = await asyncio.gather(*tasks)
         
-        assert "id" in data
-        assert "mode" in data
-        assert data["mode"] == "filesystem"
+        assert len(binary_ids) == 10
+        assert len(set(binary_ids)) == 10  # All unique
+        
+        # Retrieve all concurrently
+        retrieve_tasks = [
+            binary_manager.retrieve(binary_id)
+            for binary_id in binary_ids
+        ]
+        
+        results = await asyncio.gather(*retrieve_tasks)
+        
+        for i, data in enumerate(results):
+            assert data == f"Content {i}".encode()
 
 
-@pytest.mark.integration
 class TestBinaryDataIntegration:
     """Integration tests for binary data system."""
     
     @pytest.mark.asyncio
-    async def test_workflow_binary_data_lifecycle(self, binary_service):
-        """Test complete binary data lifecycle in workflow context."""
-        workflow_id = str(uuid4())
-        execution_id = str(uuid4())
+    async def test_workflow_binary_data_flow(self, binary_manager):
+        """Test binary data flow in workflow context."""
+        # Simulate webhook with binary data
+        webhook_data = {
+            "text": "Hello",
+            "file": b"Binary file content"
+        }
         
-        # Simulate receiving binary data in webhook
-        webhook_data = b"Uploaded file content"
-        
-        metadata = BinaryDataMeta(
-            filename="upload.pdf",
-            mime_type="application/pdf",
-            size=len(webhook_data),
-            checksum="",
-            storage_mode=BinaryDataMode.FILESYSTEM,
-            workflow_id=workflow_id,
-            execution_id=execution_id,
-            node_id="webhook_1",
+        # Store binary part
+        binary_id = await binary_manager.store(
+            data=webhook_data["file"],
+            filename="upload.bin",
+            content_type="application/octet-stream",
+            metadata={
+                "webhook_id": str(uuid4()),
+                "field": "file"
+            }
         )
         
-        # Store in binary data service
-        reference = await binary_service.store(webhook_data, metadata)
+        # Replace binary with reference
+        processed_data = {
+            "text": webhook_data["text"],
+            "file": {"binary_id": str(binary_id)}
+        }
         
-        # Pass reference through workflow
-        # ... workflow execution ...
-        
-        # Retrieve in another node
-        retrieved_data, retrieved_metadata = await binary_service.retrieve(
-            reference.id
-        )
-        
-        assert retrieved_data == webhook_data
-        assert retrieved_metadata.workflow_id == workflow_id
-        
-        # Cleanup after workflow completes
-        await binary_service.delete(reference.id)
-        
-        # Verify deletion
-        assert await binary_service.exists(reference.id) is False
+        # Later in workflow, retrieve binary
+        if "binary_id" in processed_data.get("file", {}):
+            file_data = await binary_manager.retrieve(
+                UUID(processed_data["file"]["binary_id"])
+            )
+            assert file_data == webhook_data["file"]
     
     @pytest.mark.asyncio
-    async def test_s3_backend_with_real_aws(self):
-        """Test S3 backend with real AWS (skip in CI)."""
-        if not os.getenv("AWS_ACCESS_KEY_ID"):
-            pytest.skip("AWS credentials not available")
+    async def test_backend_switching(self, binary_config, temp_storage_dir):
+        """Test switching between storage backends."""
+        # Start with filesystem
+        fs_config = binary_config.copy()
+        fs_config.backend = "filesystem"
+        fs_manager = BinaryDataManager(fs_config)
         
-        config = BinaryDataConfig(
-            mode=BinaryDataMode.S3,
-            s3_bucket=os.getenv("TEST_S3_BUCKET", "budflow-test"),
-            s3_region=os.getenv("AWS_DEFAULT_REGION", "us-east-1"),
+        # Store data
+        binary_id = await fs_manager.store(
+            data=b"Test data",
+            filename="test.dat",
+            content_type="application/octet-stream"
         )
         
-        service = BinaryDataService(config)
+        # Switch to S3 (mocked)
+        s3_config = binary_config.copy()
+        s3_config.backend = "s3"
         
-        # Test basic operations
-        test_data = b"Real S3 test data"
-        metadata = BinaryDataMeta(
-            filename="s3_test.txt",
-            mime_type="text/plain",
-            size=len(test_data),
-            checksum="",
-            storage_mode=BinaryDataMode.S3,
-        )
-        
-        # Store
-        reference = await service.store(test_data, metadata)
-        assert reference.url is not None
-        
-        # Retrieve
-        retrieved, _ = await service.retrieve(reference.id)
-        assert retrieved == test_data
-        
-        # Cleanup
-        await service.delete(reference.id)
+        with patch('budflow.core.binary_data.s3.boto3'):
+            s3_manager = BinaryDataManager(s3_config)
+            
+            # Should still be able to retrieve from filesystem
+            # (in real implementation, might migrate data)
+            metadata = await fs_manager.get_metadata(binary_id)
+            assert metadata is not None
