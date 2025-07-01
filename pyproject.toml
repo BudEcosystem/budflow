@@ -1,0 +1,147 @@
+
+[tool.poetry]
+name = "budflow"
+version = "0.1.0"
+description = "Enhanced n8n alternative with AI-first features"
+authors = ["Accubits <support@accubits.com>"]
+readme = "README.md"
+license = "Fair-code"
+homepage = "https://budflow.ai"
+repository = "https://github.com/accubits/budflow"
+documentation = "https://docs.budflow.ai"
+keywords = ["workflow", "automation", "ai", "n8n", "integration"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+fastapi = "^0.115.0"
+uvicorn = {extras = ["standard"], version = "^0.32.0"}
+pydantic = "^2.10.0"
+sqlalchemy = "^2.0.0"
+alembic = "^1.13.0"
+asyncpg = "^0.29.0"
+redis = "^5.2.0"
+celery = "^5.4.0"
+kombu = "^5.4.0"
+python-jose = {extras = ["cryptography"], version = "^3.3.0"}
+python-multipart = "^0.0.12"
+bcrypt = "^4.2.0"
+passlib = {extras = ["bcrypt"], version = "^1.7.4"}
+cryptography = "^43.0.0"
+aiofiles = "^24.1.0"
+httpx = "^0.27.0"
+websockets = "^13.1"
+pydantic-settings = "^2.6.0"
+structlog = "^24.4.0"
+opentelemetry-api = "^1.28.0"
+opentelemetry-sdk = "^1.28.0"
+opentelemetry-instrumentation-fastapi = "^0.49b0"
+opentelemetry-instrumentation-sqlalchemy = "^0.49b0"
+prometheus-client = "^0.21.0"
+langchain = "^0.3.0"
+langchain-core = "^0.3.0"
+langchain-community = "^0.3.0"
+openai = "^1.52.0"
+tiktoken = "^0.8.0"
+numpy = "^2.0.0"
+pandas = "^2.2.0"
+pymongo = "^4.10.0"
+motor = "^3.6.0"
+neo4j = "^5.26.0"
+clickhouse-driver = "^0.2.9"
+qrcode = {extras = ["pil"], version = "^8.0.0"}
+pyotp = "^2.9.0"
+croniter = "^3.0.0"
+jsonschema = "^4.23.0"
+jinja2 = "^3.1.0"
+networkx = "^3.4.0"
+email-validator = "^2.2.0"
+tenacity = "^9.0.0"
+rich = "^13.9.0"
+typer = "^0.13.0"
+aiosqlite = "^0.21.0"
+greenlet = "^3.2.3"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.3.0"
+pytest-asyncio = "^0.24.0"
+pytest-cov = "^6.0.0"
+pytest-mock = "^3.14.0"
+faker = "^33.0.0"
+black = "^24.10.0"
+isort = "^5.13.0"
+flake8 = "^7.1.0"
+mypy = "^1.13.0"
+pre-commit = "^4.0.0"
+
+[tool.poetry.scripts]
+budflow = "budflow.cli:main"
+budflow-server = "budflow.server:main"
+budflow-worker = "budflow.worker:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py", "*_test.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short --strict-markers"
+markers = [
+    "unit: Unit tests",
+    "integration: Integration tests",
+    "e2e: End-to-end tests",
+    "slow: Slow tests",
+    "ai: AI-related tests",
+    "performance: Performance tests"
+]
+asyncio_mode = "auto"
+
+[tool.black]
+line-length = 88
+target-version = ['py311']
+include = '\.pyi?$'
+extend-exclude = '''
+/(
+  # directories
+  \.eggs
+  | \.git
+  | \.hg
+  | \.mypy_cache
+  | \.tox
+  | \.venv
+  | build
+  | dist
+)/
+'''
+
+[tool.isort]
+profile = "black"
+multi_line_output = 3
+line_length = 88
+known_first_party = ["budflow"]
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+disallow_untyped_decorators = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_no_return = true
+warn_unreachable = true
+strict_equality = true
+exclude = ["build/", "dist/", ".venv/"]
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"

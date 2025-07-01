@@ -1,0 +1,1 @@
+"""Projects and folders module."""
