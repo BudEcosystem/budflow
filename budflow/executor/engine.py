@@ -387,12 +387,22 @@ class WorkflowExecutionEngine:
             "count": len(input_data)
         }
         
+        # Decrypt credentials if present
+        decrypted_credentials = None
+        if node.credentials:
+            from budflow.credentials.encryption import decrypt_credential
+            try:
+                decrypted_credentials = decrypt_credential(node.credentials)
+            except Exception as e:
+                self.logger.error(f"Failed to decrypt credentials for node {node.id}: {str(e)}")
+                raise WorkflowExecutionError(f"Credential decryption failed for node {node.id}")
+        
         # Create node execution context
         node_context = context.create_node_execution_context(
             node=node,
             node_execution=node_execution,
             input_data=input_data,
-            credentials=node.credentials  # TODO: Decrypt credentials
+            credentials=decrypted_credentials
         )
         
         # Run the node

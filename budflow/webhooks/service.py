@@ -538,8 +538,19 @@ class WebhookService:
         
         # Handle binary data
         if webhook_request.binary_data:
-            # TODO: Store binary data and pass reference
+            # Store binary data using the processor
+            from budflow.webhooks.processor import BinaryDataHandler
+            handler = BinaryDataHandler()
+            binary_id = await handler.store_binary_data(
+                webhook_request.binary_data,
+                {
+                    "mime_type": webhook_request.headers.get("content-type", "application/octet-stream"),
+                    "webhook_id": str(registration.id),
+                    "size": len(webhook_request.binary_data)
+                }
+            )
             input_data["binary"] = {
+                "binary_id": str(binary_id),
                 "size": len(webhook_request.binary_data),
                 "mime_type": webhook_request.headers.get("content-type", "application/octet-stream"),
             }

@@ -7,7 +7,12 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from uuid import uuid4
 
-from cryptography.fernet import Fernet
+from budflow.credentials.encryption import (
+    CredentialEncryptor,
+    encrypt_credential,
+    decrypt_credential,
+    get_credential_encryptor
+)
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from sqlalchemy import select, and_, or_, func
@@ -77,6 +82,12 @@ class EncryptionService:
     def encrypt(self, data: Dict[str, Any]) -> str:
         """Encrypt credential data."""
         try:
+            # Use new encryption system if available
+            from budflow.credentials.encryption import encrypt_credential
+            encrypted_data = encrypt_credential(data)
+            return json.dumps(encrypted_data)
+        except ImportError:
+            # Fallback to Fernet
             json_data = json.dumps(data)
             encrypted = self.fernet.encrypt(json_data.encode())
             return encrypted.decode()
@@ -86,6 +97,18 @@ class EncryptionService:
     def decrypt(self, encrypted_data: str) -> Dict[str, Any]:
         """Decrypt credential data."""
         try:
+            # Try new encryption system first
+            from budflow.credentials.encryption import decrypt_credential
+            data = json.loads(encrypted_data) if isinstance(encrypted_data, str) else encrypted_data
+            # Check if it's new format (has _encrypted fields)
+            if any(isinstance(v, dict) and v.get("_encrypted") for v in data.values()):
+                return decrypt_credential(data)
+            else:
+                # Fallback to Fernet
+                decrypted = self.fernet.decrypt(encrypted_data.encode())
+                return json.loads(decrypted.decode())
+        except ImportError:
+            # Fallback to Fernet
             decrypted = self.fernet.decrypt(encrypted_data.encode())
             return json.loads(decrypted.decode())
         except Exception as e:
