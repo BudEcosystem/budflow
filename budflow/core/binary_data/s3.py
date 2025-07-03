@@ -26,11 +26,15 @@ class S3Backend(StorageBackend):
         self.config = config
         self.bucket = config.s3_bucket
         
-        # Initialize S3 client
+        # Initialize S3 client with AWS credentials
         self.s3_client = boto3.client(
             's3',
             region_name=config.s3_region,
-            endpoint_url=config.s3_endpoint
+            endpoint_url=config.s3_endpoint,
+            aws_access_key_id=config.s3_access_key_id,
+            aws_secret_access_key=config.s3_secret_access_key,
+            use_ssl=True,
+            verify=False  # For development with self-signed certs
         )
         
         logger.info(

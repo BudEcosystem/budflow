@@ -67,14 +67,23 @@ class DatabaseManager:
     async def _init_postgres(self) -> None:
         """Initialize PostgreSQL connection."""
         try:
-            self.postgres_engine = create_async_engine(
-                settings.database_url,
-                pool_size=settings.database_pool_size,
-                max_overflow=settings.database_max_overflow,
-                echo=settings.database_echo,
-                pool_pre_ping=True,
-                pool_recycle=3600,  # Recycle connections every hour
-            )
+            # Check if using SQLite
+            if settings.database_url.startswith("sqlite"):
+                # SQLite doesn't support pool_size and max_overflow
+                self.postgres_engine = create_async_engine(
+                    settings.database_url,
+                    echo=settings.database_echo,
+                )
+            else:
+                # PostgreSQL/MySQL support pooling
+                self.postgres_engine = create_async_engine(
+                    settings.database_url,
+                    pool_size=settings.database_pool_size,
+                    max_overflow=settings.database_max_overflow,
+                    echo=settings.database_echo,
+                    pool_pre_ping=True,
+                    pool_recycle=3600,  # Recycle connections every hour
+                )
 
             # Create session maker
             self.async_session_maker = async_sessionmaker(

@@ -145,3 +145,31 @@ class CircularDependencyError(ExecutionError):
         super().__init__(message, error_code="CIRCULAR_DEPENDENCY", **kwargs)
         self.cycle_path = cycle_path
         self.details["cycle_path"] = cycle_path
+
+
+class CircularWorkflowError(ExecutionError):
+    """Raised when circular workflow dependency is detected."""
+    
+    def __init__(
+        self,
+        message: str,
+        workflow_path: Optional[list] = None,
+        **kwargs
+    ):
+        super().__init__(message, error_code="CIRCULAR_WORKFLOW", **kwargs)
+        self.workflow_path = workflow_path or []
+        self.details["workflow_path"] = self.workflow_path
+
+
+class WorkflowValidationError(ExecutionError):
+    """Raised when workflow validation fails."""
+    
+    def __init__(
+        self,
+        message: str,
+        validation_errors: Optional[list] = None,
+        **kwargs
+    ):
+        super().__init__(message, error_code="WORKFLOW_VALIDATION", **kwargs)
+        self.validation_errors = validation_errors or []
+        self.details["validation_errors"] = self.validation_errors

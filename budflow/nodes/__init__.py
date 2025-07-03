@@ -18,9 +18,13 @@ from .triggers import (
 )
 
 from .actions import (
-    HttpRequestNode,
+    HTTPNode,
     EmailNode,
     DatabaseNode,
+    PostgreSQLNode,
+    MySQLNode,
+    MongoDBNode,
+    FileNode,
 )
 
 from .control import (
@@ -57,9 +61,13 @@ __all__ = [
     "ScheduleTriggerNode",
     
     # Action nodes
-    "HttpRequestNode",
+    "HTTPNode",
     "EmailNode",
     "DatabaseNode",
+    "PostgreSQLNode",
+    "MySQLNode", 
+    "MongoDBNode",
+    "FileNode",
     
     # Control nodes
     "IfNode",

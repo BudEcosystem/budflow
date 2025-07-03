@@ -43,6 +43,9 @@ class WorkflowExecutionEngine:
         input_data: Optional[Dict[str, Any]] = None,
         user_id: Optional[int] = None,
         timeout_seconds: Optional[int] = None,
+        parent_execution: Optional[WorkflowExecution] = None,
+        execution_depth: int = 0,
+        execution_stack: Optional[List[int]] = None,
     ) -> WorkflowExecution:
         """Execute a workflow."""
         self.logger.info(
@@ -69,7 +72,7 @@ class WorkflowExecutionEngine:
         
         # Create workflow execution record
         workflow_execution = await self._create_workflow_execution(
-            workflow, mode, input_data, user_id
+            workflow, mode, input_data, user_id, parent_execution, execution_depth, execution_stack
         )
         
         # Create execution context
@@ -186,7 +189,10 @@ class WorkflowExecutionEngine:
         workflow: Workflow,
         mode: ExecutionMode,
         input_data: Optional[Dict[str, Any]],
-        user_id: Optional[int]
+        user_id: Optional[int],
+        parent_execution: Optional[WorkflowExecution] = None,
+        execution_depth: int = 0,
+        execution_stack: Optional[List[int]] = None
     ) -> WorkflowExecution:
         """Create workflow execution record."""
         workflow_execution = WorkflowExecution(
@@ -194,7 +200,10 @@ class WorkflowExecutionEngine:
             user_id=user_id,
             mode=mode,
             status=ExecutionStatus.NEW,
-            data=input_data
+            data=input_data,
+            parent_execution_id=parent_execution.id if parent_execution else None,
+            execution_depth=execution_depth,
+            execution_stack=execution_stack or []
         )
         
         self.db_session.add(workflow_execution)

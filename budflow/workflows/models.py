@@ -38,6 +38,7 @@ class NodeType(str, Enum):
     WEBHOOK = "webhook"
     SCHEDULE = "schedule"
     MANUAL = "manual"
+    SUBWORKFLOW = "subworkflow"  # For workflow composition
 
 
 class ExecutionMode(str, Enum):
@@ -425,6 +426,13 @@ class WorkflowExecution(Base):
     )
     retry_count: Mapped[int] = mapped_column(Integer, default=0)
     
+    # Workflow composition (parent-child relationships)
+    parent_execution_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("workflow_executions.id", ondelete="CASCADE")
+    )
+    execution_depth: Mapped[int] = mapped_column(Integer, default=0)
+    execution_stack: Mapped[Optional[List[int]]] = mapped_column(JSON)  # Stack of workflow IDs to detect cycles
+    
     # Metadata
     created_at: Mapped[datetime] = mapped_column(DateTime, default=func.now())
     
@@ -437,6 +445,19 @@ class WorkflowExecution(Base):
     )
     original_execution: Mapped[Optional["WorkflowExecution"]] = relationship(
         "WorkflowExecution", remote_side=[id], back_populates="retries"
+    )
+    
+    # Parent-child relationships for workflow composition
+    parent_execution: Mapped[Optional["WorkflowExecution"]] = relationship(
+        "WorkflowExecution", 
+        remote_side=[id], 
+        back_populates="child_executions",
+        foreign_keys=[parent_execution_id]
+    )
+    child_executions: Mapped[List["WorkflowExecution"]] = relationship(
+        "WorkflowExecution", 
+        back_populates="parent_execution",
+        cascade="all, delete-orphan"
     )
     
     # Indexes
@@ -482,6 +503,9 @@ class WorkflowExecution(Base):
             "duration_ms": self.duration_ms,
             "retry_of": self.retry_of,
             "retry_count": self.retry_count,
+            "parent_execution_id": self.parent_execution_id,
+            "execution_depth": self.execution_depth,
+            "execution_stack": self.execution_stack,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "success_rate": self.success_rate,
         }

@@ -725,3 +725,99 @@ class WorkflowService:
             "Workflow deactivated",
             workflow_id=workflow.id,
         )
+    
+    # Workflow composition methods
+    
+    async def validate_workflow_composition(
+        self,
+        workflow_id: UUID,
+        user: User,
+        max_depth: int = 10
+    ) -> Dict[str, Any]:
+        """Validate workflow composition for circular dependencies."""
+        from .composition import WorkflowCompositionService
+        
+        workflow = await self._get_workflow_with_permission_check(
+            workflow_id, user, WorkflowPermission.READ
+        )
+        
+        composition_service = WorkflowCompositionService(self.db)
+        return await composition_service.validate_workflow_composition(
+            workflow.id, max_depth
+        )
+    
+    async def get_workflow_dependencies(
+        self,
+        workflow_id: UUID,
+        user: User,
+        recursive: bool = True
+    ) -> List[Dict[str, Any]]:
+        """Get workflows that this workflow depends on."""
+        from .composition import WorkflowCompositionService
+        
+        workflow = await self._get_workflow_with_permission_check(
+            workflow_id, user, WorkflowPermission.READ
+        )
+        
+        composition_service = WorkflowCompositionService(self.db)
+        return await composition_service.get_workflow_dependencies(
+            workflow.id, recursive
+        )
+    
+    async def get_workflow_dependents(
+        self,
+        workflow_id: UUID,
+        user: User
+    ) -> List[Dict[str, Any]]:
+        """Get workflows that depend on this workflow."""
+        from .composition import WorkflowCompositionService
+        
+        workflow = await self._get_workflow_with_permission_check(
+            workflow_id, user, WorkflowPermission.READ
+        )
+        
+        composition_service = WorkflowCompositionService(self.db)
+        return await composition_service.get_workflow_dependents(workflow.id)
+    
+    async def get_workflow_composition_graph(
+        self,
+        workflow_id: UUID,
+        user: User
+    ) -> Dict[str, Any]:
+        """Get the workflow composition graph."""
+        from .composition import WorkflowCompositionService
+        
+        workflow = await self._get_workflow_with_permission_check(
+            workflow_id, user, WorkflowPermission.READ
+        )
+        
+        composition_service = WorkflowCompositionService(self.db)
+        return await composition_service.get_workflow_composition_graph(workflow.id)
+    
+    async def analyze_workflow_composition(
+        self,
+        workflow_id: UUID,
+        user: User
+    ) -> Dict[str, Any]:
+        """Analyze workflow composition for optimization opportunities."""
+        from .composition import WorkflowCompositionService
+        
+        workflow = await self._get_workflow_with_permission_check(
+            workflow_id, user, WorkflowPermission.READ
+        )
+        
+        composition_service = WorkflowCompositionService(self.db)
+        return await composition_service.analyze_workflow_composition(workflow.id)
+    
+    async def get_child_executions(
+        self,
+        execution_id: int,
+        user: User
+    ) -> List[Any]:
+        """Get child executions of a workflow execution."""
+        from .composition import WorkflowCompositionService
+        
+        # TODO: Add permission check for execution
+        
+        composition_service = WorkflowCompositionService(self.db)
+        return await composition_service.get_child_executions(execution_id)

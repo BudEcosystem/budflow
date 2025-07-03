@@ -45,6 +45,7 @@ class ParameterType(str, Enum):
 class NodeParameter(BaseModel):
     """Node parameter definition."""
     name: str = Field(..., description="Parameter name")
+    display_name: Optional[str] = Field(None, description="Parameter display name")
     type: ParameterType = Field(..., description="Parameter type")
     required: bool = Field(default=False, description="Is parameter required")
     default: Any = Field(default=None, description="Default value")

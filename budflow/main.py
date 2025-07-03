@@ -183,11 +183,13 @@ def create_app() -> FastAPI:
     from budflow.workflows.routes import router as workflows_router
     from budflow.executions.routes import router as executions_router
     from budflow.credentials.routes import router as credentials_router
+    from budflow.nodes.routes import router as nodes_router
     
     app.include_router(auth_router, prefix="/api/v1", tags=["Authentication"])
     app.include_router(workflows_router, prefix="/api/v1", tags=["Workflows"])
     app.include_router(executions_router, prefix="/api/v1", tags=["Executions"])
     app.include_router(credentials_router, prefix="/api/v1", tags=["Credentials"])
+    app.include_router(nodes_router, tags=["Nodes"])
     
     # Additional routers (to be added)
     # app.include_router(integrations_router, prefix="/api/v1/integrations", tags=["Integrations"])

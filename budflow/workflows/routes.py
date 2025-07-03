@@ -549,3 +549,170 @@ async def get_workflow_executions(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Access denied",
         )
+
+
+# Workflow composition endpoints
+
+@router.post("/{workflow_id}/validate-composition")
+async def validate_workflow_composition(
+    workflow_id: UUID,
+    max_depth: int = Query(10, ge=1, le=20, description="Maximum nesting depth"),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+    node_registry: NodeRegistry = Depends(get_node_registry),
+):
+    """Validate workflow composition for circular dependencies."""
+    service = WorkflowService(db, node_registry)
+    
+    try:
+        result = await service.validate_workflow_composition(
+            workflow_id, current_user, max_depth
+        )
+        return result
+    except WorkflowNotFoundError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Workflow not found",
+        )
+    except WorkflowPermissionError:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied",
+        )
+
+
+@router.get("/{workflow_id}/dependencies")
+async def get_workflow_dependencies(
+    workflow_id: UUID,
+    recursive: bool = Query(True, description="Include recursive dependencies"),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+    node_registry: NodeRegistry = Depends(get_node_registry),
+):
+    """Get workflows that this workflow depends on."""
+    service = WorkflowService(db, node_registry)
+    
+    try:
+        dependencies = await service.get_workflow_dependencies(
+            workflow_id, current_user, recursive
+        )
+        return dependencies
+    except WorkflowNotFoundError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Workflow not found",
+        )
+    except WorkflowPermissionError:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied",
+        )
+
+
+@router.get("/{workflow_id}/dependents")
+async def get_workflow_dependents(
+    workflow_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+    node_registry: NodeRegistry = Depends(get_node_registry),
+):
+    """Get workflows that depend on this workflow."""
+    service = WorkflowService(db, node_registry)
+    
+    try:
+        dependents = await service.get_workflow_dependents(
+            workflow_id, current_user
+        )
+        return dependents
+    except WorkflowNotFoundError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Workflow not found",
+        )
+    except WorkflowPermissionError:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied",
+        )
+
+
+@router.get("/{workflow_id}/composition-graph")
+async def get_workflow_composition_graph(
+    workflow_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+    node_registry: NodeRegistry = Depends(get_node_registry),
+):
+    """Get the workflow composition graph."""
+    service = WorkflowService(db, node_registry)
+    
+    try:
+        graph = await service.get_workflow_composition_graph(
+            workflow_id, current_user
+        )
+        return graph
+    except WorkflowNotFoundError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Workflow not found",
+        )
+    except WorkflowPermissionError:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied",
+        )
+
+
+@router.get("/{workflow_id}/composition-analysis")
+async def analyze_workflow_composition(
+    workflow_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+    node_registry: NodeRegistry = Depends(get_node_registry),
+):
+    """Analyze workflow composition for optimization opportunities."""
+    service = WorkflowService(db, node_registry)
+    
+    try:
+        analysis = await service.analyze_workflow_composition(
+            workflow_id, current_user
+        )
+        return analysis
+    except WorkflowNotFoundError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Workflow not found",
+        )
+    except WorkflowPermissionError:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied",
+        )
+
+
+@router.post("/validate-compositions")
+async def bulk_validate_compositions(
+    workflow_ids: List[UUID],
+    max_depth: int = Query(10, ge=1, le=20, description="Maximum nesting depth"),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+    node_registry: NodeRegistry = Depends(get_node_registry),
+):
+    """Bulk validate multiple workflow compositions."""
+    service = WorkflowService(db, node_registry)
+    
+    results = []
+    for workflow_id in workflow_ids:
+        try:
+            result = await service.validate_workflow_composition(
+                workflow_id, current_user, max_depth
+            )
+            results.append(result)
+        except Exception as e:
+            results.append({
+                "workflow_id": str(workflow_id),
+                "valid": False,
+                "error": str(e)
+            })
+    
+    return results

@@ -164,8 +164,9 @@ class NodeRegistry:
         """Register built-in node types."""
         # Import here to avoid circular imports
         from .triggers import ManualTriggerNode, WebhookTriggerNode, ScheduleTriggerNode
-        from .actions import HttpRequestNode, EmailNode, DatabaseNode
+        from .actions import HTTPNode, EmailNode, DatabaseNode, PostgreSQLNode, MySQLNode, MongoDBNode, FileNode
         from .control import IfNode, LoopNode, WaitNode, StopNode
+        from .implementations import SubWorkflowNode
         
         # Register trigger nodes
         self._register_node("manual.trigger", ManualTriggerNode)
@@ -173,15 +174,22 @@ class NodeRegistry:
         self._register_node("schedule.trigger", ScheduleTriggerNode)
         
         # Register action nodes
-        self._register_node("http.request", HttpRequestNode)
+        self._register_node("http.request", HTTPNode)
         self._register_node("email.send", EmailNode)
         self._register_node("database.query", DatabaseNode)
+        self._register_node("postgresql.query", PostgreSQLNode)
+        self._register_node("mysql.query", MySQLNode)
+        self._register_node("mongodb.query", MongoDBNode)
+        self._register_node("file.operation", FileNode)
         
         # Register control nodes
         self._register_node("if", IfNode)
         self._register_node("loop", LoopNode)
         self._register_node("wait", WaitNode)
         self._register_node("stop", StopNode)
+        
+        # Register workflow composition node
+        self._register_node("subworkflow", SubWorkflowNode)
     
     def _register_node(self, type_key: str, node_class: Type[BaseNode]):
         """Internal method to register a node."""
@@ -215,10 +223,19 @@ class NodeRegistry:
     def get_nodes_by_type(self, node_type: NodeType) -> Dict[str, Type[BaseNode]]:
         """Get all nodes of a specific type."""
         result = {}
+        
+        # Map generic types to specific types
+        trigger_types = {NodeType.MANUAL, NodeType.WEBHOOK, NodeType.SCHEDULE}
+        
         for type_key, node_class in self._nodes.items():
             definition = self._definitions.get(type_key)
-            if definition and definition.type == node_type:
-                result[type_key] = node_class
+            if definition:
+                # Handle generic trigger type
+                if node_type == NodeType.TRIGGER and definition.type in trigger_types:
+                    result[type_key] = node_class
+                # Handle exact type match
+                elif definition.type == node_type:
+                    result[type_key] = node_class
         return result
     
     def get_nodes_by_category(self, category: str) -> Dict[str, Type[BaseNode]]:

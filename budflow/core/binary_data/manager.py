@@ -33,11 +33,20 @@ class BinaryDataManager:
         """Initialize binary data manager."""
         self.config = config
         
-        # Initialize storage backend
+        # Initialize storage backend with credentials from settings
         if config.backend == "filesystem":
             self.backend = FileSystemBackend(config)
         elif config.backend == "s3":
-            self.backend = S3Backend(config)
+            from budflow.config import settings
+            # Update config with settings values
+            s3_config = config.copy(
+                s3_bucket=config.s3_bucket or settings.s3_bucket,
+                s3_region=config.s3_region or settings.s3_region,
+                s3_endpoint=config.s3_endpoint or settings.s3_endpoint_url,
+                s3_access_key_id=config.s3_access_key_id or settings.s3_access_key_id,
+                s3_secret_access_key=config.s3_secret_access_key or settings.s3_secret_access_key
+            )
+            self.backend = S3Backend(s3_config)
         else:
             raise BinaryDataError(f"Unknown backend: {config.backend}")
         

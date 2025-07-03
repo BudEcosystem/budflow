@@ -31,6 +31,8 @@ class BinaryDataConfig:
     s3_bucket: Optional[str] = None
     s3_region: Optional[str] = None
     s3_endpoint: Optional[str] = None
+    s3_access_key_id: Optional[str] = None
+    s3_secret_access_key: Optional[str] = None
     max_file_size: int = 100 * 1024 * 1024  # 100MB
     allowed_mime_types: Optional[List[str]] = None
     ttl_days: Optional[int] = None
