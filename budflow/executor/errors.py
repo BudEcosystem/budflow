@@ -1,6 +1,6 @@
 """Execution engine error classes."""
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 
 class ExecutionError(Exception):
@@ -173,3 +173,63 @@ class WorkflowValidationError(ExecutionError):
         super().__init__(message, error_code="WORKFLOW_VALIDATION", **kwargs)
         self.validation_errors = validation_errors or []
         self.details["validation_errors"] = self.validation_errors
+
+
+class InvalidStartNodeError(ExecutionError):
+    """Raised when partial execution start node is invalid."""
+    
+    def __init__(
+        self,
+        message: str,
+        node_id: int,
+        workflow_id: int,
+        **kwargs
+    ):
+        super().__init__(message, error_code="INVALID_START_NODE", **kwargs)
+        self.node_id = node_id
+        self.workflow_id = workflow_id
+        self.details.update({
+            "node_id": node_id,
+            "workflow_id": workflow_id,
+        })
+
+
+class ResourceExhaustedError(ExecutionError):
+    """Raised when system resources are exhausted."""
+    
+    def __init__(
+        self,
+        message: str,
+        resource_type: str,
+        requested: Any = None,
+        available: Any = None,
+        **kwargs
+    ):
+        super().__init__(message, error_code="RESOURCE_EXHAUSTED", **kwargs)
+        self.resource_type = resource_type
+        self.requested = requested
+        self.available = available
+        self.details.update({
+            "resource_type": resource_type,
+            "requested": str(requested),
+            "available": str(available),
+        })
+
+
+class InvalidWorkflowStructureError(ExecutionError):
+    """Raised when workflow structure is invalid."""
+    
+    def __init__(
+        self,
+        message: str,
+        workflow_id: Optional[int] = None,
+        structure_issues: Optional[List[str]] = None,
+        **kwargs
+    ):
+        super().__init__(message, error_code="INVALID_WORKFLOW_STRUCTURE", **kwargs)
+        self.workflow_id = workflow_id
+        self.structure_issues = structure_issues or []
+        self.details.update({
+            "workflow_id": workflow_id,
+            "structure_issues": self.structure_issues,
+        })

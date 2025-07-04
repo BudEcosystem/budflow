@@ -1,482 +1,483 @@
-"""Test partial execution functionality."""
+"""
+Comprehensive tests for partial execution functionality.
+
+Partial execution allows starting workflow execution from a specific node
+rather than from the beginning, which is critical for debugging and
+iterative workflow development.
+"""
 
 import pytest
 from datetime import datetime, timezone
-from typing import Dict, Any, List
-from unittest.mock import Mock, AsyncMock, patch
+from typing import Dict, List, Any, Optional
+from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
-from budflow.executions.partial import (
-    PartialExecutionEngine,
-    DependencyGraph,
-    NodeNotFoundError,
-    MaxExecutionDepthError,
-    CircularDependencyError
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from budflow.executor.engine import WorkflowExecutionEngine
+from budflow.executor.errors import (
+    WorkflowExecutionError,
+    CircularDependencyError,
+    InvalidStartNodeError,
 )
-from budflow.workflows.models import Workflow, WorkflowNode, WorkflowConnection
-from budflow.workflows.models import WorkflowExecution, ExecutionStatus, ExecutionMode
-from budflow.executions.schemas import PartialExecutionRequest
+from budflow.workflows.models import (
+    Workflow, WorkflowNode, WorkflowConnection,
+    WorkflowExecution, NodeExecution,
+    WorkflowStatus, ExecutionStatus, NodeExecutionStatus,
+    ExecutionMode, NodeType
+)
+from budflow.nodes.base import BaseNode, NodeDefinition
+from budflow.nodes.registry import NodeRegistry
 
 
-@pytest.fixture
-def sample_workflow():
-    """Create a sample workflow for testing."""
-    workflow = Workflow(
-        id=1,
-        name="Test Workflow",
-        nodes=[
-            {"id": "node1", "name": "Start Node", "type": "manual.trigger", "position": [100, 100]},
-            {"id": "node2", "name": "Process Node", "type": "http.request", "position": [200, 100]},
-            {"id": "node3", "name": "Transform Node", "type": "code.javascript", "position": [300, 100]},
-            {"id": "node4", "name": "End Node", "type": "webhook.response", "position": [400, 100]}
-        ],
-        connections=[
-            {"source": "node1", "target": "node2", "sourceOutput": "main", "targetInput": "main"},
-            {"source": "node2", "target": "node3", "sourceOutput": "main", "targetInput": "main"},
-            {"source": "node3", "target": "node4", "sourceOutput": "main", "targetInput": "main"}
+class MockNode(BaseNode):
+    """Mock node for testing."""
+    
+    @classmethod
+    def get_definition(cls) -> NodeDefinition:
+        return NodeDefinition(
+            name="MockNode",
+            type=NodeType.ACTION,
+            description="Mock node for testing",
+            inputs=["main"],
+            outputs=["main"]
+        )
+    
+    async def execute(self) -> List[Dict[str, Any]]:
+        # Return input data with node name appended
+        input_data = self.get_input_data()
+        return [{
+            **item,
+            "processed_by": self.node_name
+        } for item in input_data]
+
+
+class TestPartialExecution:
+    """Test suite for partial execution functionality."""
+    
+    @pytest.fixture
+    async def db_session(self):
+        """Mock database session."""
+        session = AsyncMock(spec=AsyncSession)
+        return session
+    
+    @pytest.fixture
+    def node_registry(self):
+        """Mock node registry."""
+        registry = MagicMock(spec=NodeRegistry)
+        registry.get_node_class.return_value = MockNode
+        return registry
+    
+    @pytest.fixture
+    def sample_workflow(self):
+        """Create a sample workflow for testing."""
+        workflow = Workflow(
+            id=1,
+            name="Test Workflow",
+            status=WorkflowStatus.ACTIVE,
+            user_id=1
+        )
+        workflow.uuid = str(uuid4())
+        
+        # Create nodes: Start -> Process1 -> Process2 -> Process3 -> End
+        nodes = []
+        for i, (name, x) in enumerate([("Start", 0), ("Process1", 100), ("Process2", 200), ("Process3", 300), ("End", 400)], 1):
+            node = WorkflowNode(
+                id=i,
+                workflow_id=1,
+                name=name,
+                type=NodeType.ACTION,
+                position={"x": x, "y": 0},
+                parameters={}
+            )
+            node.uuid = str(uuid4())
+            nodes.append(node)
+        
+        # Create linear connections
+        connections = [
+            WorkflowConnection(
+                id=1,
+                workflow_id=1,
+                source_node_id=1,
+                source_output="main",
+                target_node_id=2,
+                target_input="main"
+            ),
+            WorkflowConnection(
+                id=2,
+                workflow_id=1,
+                source_node_id=2,
+                source_output="main",
+                target_node_id=3,
+                target_input="main"
+            ),
+            WorkflowConnection(
+                id=3,
+                workflow_id=1,
+                source_node_id=3,
+                source_output="main",
+                target_node_id=4,
+                target_input="main"
+            ),
+            WorkflowConnection(
+                id=4,
+                workflow_id=1,
+                source_node_id=4,
+                source_output="main",
+                target_node_id=5,
+                target_input="main"
+            )
         ]
-    )
-    return workflow
-
-
-@pytest.fixture
-def complex_workflow():
-    """Create a complex workflow with branching for testing."""
-    workflow = Workflow(
-        id=2,
-        name="Complex Workflow",
-        nodes=[
-            {"id": "start", "name": "Start", "type": "manual.trigger", "position": [100, 100]},
-            {"id": "branch1", "name": "Branch 1", "type": "http.request", "position": [200, 50]},
-            {"id": "branch2", "name": "Branch 2", "type": "database.query", "position": [200, 150]},
-            {"id": "merge", "name": "Merge", "type": "code.javascript", "position": [300, 100]},
-            {"id": "final", "name": "Final", "type": "email.send", "position": [400, 100]}
-        ],
-        connections=[
-            {"source": "start", "target": "branch1", "sourceOutput": "main", "targetInput": "main"},
-            {"source": "start", "target": "branch2", "sourceOutput": "main", "targetInput": "main"},
-            {"source": "branch1", "target": "merge", "sourceOutput": "main", "targetInput": "main"},
-            {"source": "branch2", "target": "merge", "sourceOutput": "main", "targetInput": "main"},
-            {"source": "merge", "target": "final", "sourceOutput": "main", "targetInput": "main"}
+        
+        workflow.workflow_nodes = nodes
+        workflow.workflow_connections = connections
+        
+        return workflow
+    
+    @pytest.fixture
+    def branching_workflow(self):
+        """Create a workflow with branching for testing."""
+        workflow = Workflow(
+            id=2,
+            name="Branching Workflow",
+            status=WorkflowStatus.ACTIVE,
+            user_id=1
+        )
+        workflow.uuid = str(uuid4())
+        
+        # Create nodes with branching:
+        #     -> Branch1 -> Merge
+        # Start            
+        #     -> Branch2 -> Merge -> End
+        nodes = []
+        node_specs = [
+            (1, "Start", 0, 0),
+            (2, "Branch1", 100, -50),
+            (3, "Branch2", 100, 50),
+            (4, "Merge", 200, 0),
+            (5, "End", 300, 0)
         ]
-    )
-    return workflow
-
-
-@pytest.fixture
-def mock_db_session():
-    """Create mock database session."""
-    session = AsyncMock()
-    session.execute = AsyncMock()
-    session.commit = AsyncMock()
-    session.add = Mock()
-    return session
-
-
-@pytest.fixture
-def partial_execution_engine(mock_db_session):
-    """Create partial execution engine with mocked dependencies."""
-    engine = PartialExecutionEngine(mock_db_session)
-    engine.execution_service = AsyncMock()
-    engine.workflow_service = AsyncMock()
-    return engine
-
-
-class TestDependencyGraph:
-    """Test dependency graph construction and analysis."""
-    
-    def test_build_dependency_graph_linear(self, sample_workflow):
-        """Test building dependency graph for linear workflow."""
-        engine = PartialExecutionEngine(None)
-        graph = engine.build_dependency_graph(sample_workflow)
+        for node_id, name, x, y in node_specs:
+            node = WorkflowNode(
+                id=node_id,
+                workflow_id=2,
+                name=name,
+                type=NodeType.ACTION,
+                position={"x": x, "y": y}
+            )
+            node.uuid = str(uuid4())
+            nodes.append(node)
         
-        expected = {
-            "node1": ["node2"],
-            "node2": ["node3"],
-            "node3": ["node4"],
-            "node4": []
+        connections = [
+            WorkflowConnection(id=1, workflow_id=2, source_node_id=1, source_output="main", target_node_id=2, target_input="main"),
+            WorkflowConnection(id=2, workflow_id=2, source_node_id=1, source_output="main", target_node_id=3, target_input="main"),
+            WorkflowConnection(id=3, workflow_id=2, source_node_id=2, source_output="main", target_node_id=4, target_input="main"),
+            WorkflowConnection(id=4, workflow_id=2, source_node_id=3, source_output="main", target_node_id=4, target_input="main"),
+            WorkflowConnection(id=5, workflow_id=2, source_node_id=4, source_output="main", target_node_id=5, target_input="main")
+        ]
+        
+        workflow.workflow_nodes = nodes
+        workflow.workflow_connections = connections
+        
+        return workflow
+    
+    @pytest.mark.asyncio
+    async def test_partial_execution_from_middle_node(self, db_session, sample_workflow):
+        """Test starting execution from a middle node."""
+        engine = WorkflowExecutionEngine(db_session)
+        
+        # Mock data that would have been produced by previous nodes
+        mock_previous_data = {
+            "Process1": [{"data": "from_start", "processed_by": "Start"}]
         }
-        assert graph.forward_dependencies == expected
         
-        expected_reverse = {
-            "node1": [],
-            "node2": ["node1"],
-            "node3": ["node2"],
-            "node4": ["node3"]
+        # Execute starting from Process2
+        with patch.object(engine, '_load_workflow', return_value=sample_workflow):
+            with patch.object(engine, '_create_partial_workflow_execution') as mock_create:
+                mock_execution = MagicMock()
+                mock_execution.id = 1
+                mock_execution.uuid = str(uuid4())
+                mock_create.return_value = mock_execution
+                
+                result = await engine.execute_partial_workflow(
+                    workflow_id=1,
+                    start_node_id=3,  # Process2
+                    previous_node_data=mock_previous_data,
+                    mode=ExecutionMode.MANUAL
+                )
+                
+                # Verify execution was created with partial flag
+                mock_create.assert_called_once()
+                call_args = mock_create.call_args[1]
+                assert call_args['execution_type'] == 'partial'
+                assert call_args['start_node'] == 'Process2'
+    
+    @pytest.mark.asyncio
+    async def test_partial_execution_validates_start_node(self, db_session, sample_workflow):
+        """Test that partial execution validates the start node exists."""
+        engine = WorkflowExecutionEngine(db_session)
+        
+        with patch.object(engine, '_load_workflow', return_value=sample_workflow):
+            # Try to start from non-existent node
+            with pytest.raises(InvalidStartNodeError) as exc_info:
+                await engine.execute_partial_workflow(
+                    workflow_id=1,
+                    start_node_id=999,  # Non-existent
+                    previous_node_data={},
+                    mode=ExecutionMode.MANUAL
+                )
+            
+            assert "Node 999 not found in workflow" in str(exc_info.value)
+    
+    @pytest.mark.asyncio
+    async def test_partial_execution_requires_previous_data(self, db_session, sample_workflow):
+        """Test that partial execution requires data from previous nodes."""
+        engine = WorkflowExecutionEngine(db_session)
+        
+        with patch.object(engine, '_load_workflow', return_value=sample_workflow):
+            # Try to start from Process3 without data from Process2
+            with pytest.raises(WorkflowExecutionError) as exc_info:
+                await engine.execute_partial_workflow(
+                    workflow_id=1,
+                    start_node_id=4,  # Process3
+                    previous_node_data={},  # Missing required data
+                    mode=ExecutionMode.MANUAL
+                )
+            
+            assert "Missing required input data" in str(exc_info.value)
+    
+    @pytest.mark.asyncio
+    async def test_partial_execution_with_branching(self, db_session, branching_workflow):
+        """Test partial execution in a branching workflow."""
+        engine = WorkflowExecutionEngine(db_session)
+        
+        # Mock data from both branches
+        mock_previous_data = {
+            "Branch1": [{"data": "from_branch1", "processed_by": "Branch1"}],
+            "Branch2": [{"data": "from_branch2", "processed_by": "Branch2"}]
         }
-        assert graph.reverse_dependencies == expected_reverse
+        
+        with patch.object(engine, '_load_workflow', return_value=branching_workflow):
+            with patch.object(engine, '_create_workflow_execution') as mock_create:
+                mock_execution = MagicMock()
+                mock_execution.id = 1
+                mock_execution.uuid = uuid4()
+                mock_create.return_value = mock_execution
+                
+                # Start from Merge node
+                with patch.object(engine, '_create_partial_workflow_execution') as mock_create_exec:
+                    mock_exec = MagicMock()
+                    mock_exec.id = 1
+                    mock_exec.uuid = str(uuid4())
+                    mock_create_exec.return_value = mock_exec
+                    
+                    result = await engine.execute_partial_workflow(
+                        workflow_id=2,
+                        start_node_id=4,  # Merge
+                        previous_node_data=mock_previous_data,
+                        mode=ExecutionMode.MANUAL
+                    )
+                    
+                    # Verify merge node receives data from both branches
+                    assert mock_create_exec.called
     
-    def test_build_dependency_graph_branching(self, complex_workflow):
-        """Test building dependency graph for branching workflow."""
-        engine = PartialExecutionEngine(None)
-        graph = engine.build_dependency_graph(complex_workflow)
+    @pytest.mark.asyncio
+    async def test_partial_execution_creates_dependency_graph(self, db_session, sample_workflow):
+        """Test that partial execution correctly builds dependency graph."""
+        engine = WorkflowExecutionEngine(db_session)
         
-        expected_forward = {
-            "start": ["branch1", "branch2"],
-            "branch1": ["merge"],
-            "branch2": ["merge"],
-            "merge": ["final"],
-            "final": []
-        }
-        assert graph.forward_dependencies == expected_forward
-        
-        expected_reverse = {
-            "start": [],
-            "branch1": ["start"],
-            "branch2": ["start"],
-            "merge": ["branch1", "branch2"],
-            "final": ["merge"]
-        }
-        assert graph.reverse_dependencies == expected_reverse
+        with patch.object(engine, '_load_workflow', return_value=sample_workflow):
+            # Build dependency graph starting from Process2
+            graph = await engine._build_partial_execution_graph(
+                workflow=sample_workflow,
+                start_node_id=3  # Process2
+            )
+            
+            # Verify graph includes only Process2 and subsequent nodes
+            assert 3 in graph.nodes  # Process2
+            assert 4 in graph.nodes  # Process3
+            assert 5 in graph.nodes  # End
+            
+            # Verify earlier nodes are excluded
+            assert 1 not in graph.nodes  # Start
+            assert 2 not in graph.nodes  # Process1
     
-    def test_get_nodes_to_execute_from_start(self, sample_workflow):
-        """Test getting nodes to execute starting from first node."""
-        engine = PartialExecutionEngine(None)
-        graph = engine.build_dependency_graph(sample_workflow)
-        
-        nodes_to_execute = engine.get_nodes_to_execute(graph, "node1")
-        expected = {"node1", "node2", "node3", "node4"}
-        assert nodes_to_execute == expected
-    
-    def test_get_nodes_to_execute_from_middle(self, sample_workflow):
-        """Test getting nodes to execute starting from middle node."""
-        engine = PartialExecutionEngine(None)
-        graph = engine.build_dependency_graph(sample_workflow)
-        
-        nodes_to_execute = engine.get_nodes_to_execute(graph, "node3")
-        expected = {"node3", "node4"}
-        assert nodes_to_execute == expected
-    
-    def test_get_nodes_to_execute_from_end(self, sample_workflow):
-        """Test getting nodes to execute starting from last node."""
-        engine = PartialExecutionEngine(None)
-        graph = engine.build_dependency_graph(sample_workflow)
-        
-        nodes_to_execute = engine.get_nodes_to_execute(graph, "node4")
-        expected = {"node4"}
-        assert nodes_to_execute == expected
-    
-    def test_get_nodes_to_execute_branching(self, complex_workflow):
-        """Test getting nodes to execute in branching workflow."""
-        engine = PartialExecutionEngine(None)
-        graph = engine.build_dependency_graph(complex_workflow)
-        
-        # Starting from branch1 should include merge and final
-        nodes_to_execute = engine.get_nodes_to_execute(graph, "branch1")
-        expected = {"branch1", "merge", "final"}
-        assert nodes_to_execute == expected
-        
-        # Starting from merge should include final
-        nodes_to_execute = engine.get_nodes_to_execute(graph, "merge")
-        expected = {"merge", "final"}
-        assert nodes_to_execute == expected
-
-
-class TestPartialExecutionValidation:
-    """Test validation for partial execution requests."""
-    
-    async def test_validate_start_node_exists(self, partial_execution_engine, sample_workflow):
-        """Test validation passes when start node exists."""
-        engine = partial_execution_engine
-        
-        # Mock workflow service
-        engine.workflow_service.get_workflow.return_value = sample_workflow
-        
-        # Should not raise
-        await engine.validate_start_node("1", "node2")
-    
-    async def test_validate_start_node_not_found(self, partial_execution_engine, sample_workflow):
-        """Test validation fails when start node doesn't exist."""
-        engine = partial_execution_engine
-        
-        # Mock workflow service
-        engine.workflow_service.get_workflow.return_value = sample_workflow
-        
-        with pytest.raises(NodeNotFoundError) as exc_info:
-            await engine.validate_start_node("1", "nonexistent_node")
-        
-        assert "not found" in str(exc_info.value).lower()
-    
-    async def test_validate_circular_dependency_detection(self, partial_execution_engine):
-        """Test detection of circular dependencies."""
-        engine = partial_execution_engine
-        
+    @pytest.mark.asyncio
+    async def test_partial_execution_handles_circular_dependencies(self, db_session):
+        """Test that partial execution detects circular dependencies."""
         # Create workflow with circular dependency
-        circular_workflow = Workflow(
+        workflow = Workflow(
             id=3,
             name="Circular Workflow",
-            nodes=[
-                {"id": "node1", "name": "Node 1", "type": "manual.trigger"},
-                {"id": "node2", "name": "Node 2", "type": "http.request"},
-                {"id": "node3", "name": "Node 3", "type": "code.javascript"}
-            ],
-            connections=[
-                {"source": "node1", "target": "node2"},
-                {"source": "node2", "target": "node3"},
-                {"source": "node3", "target": "node1"}  # Creates cycle
-            ]
+            status=WorkflowStatus.ACTIVE,
+            user_id=1
         )
+        workflow.uuid = str(uuid4())
         
-        with pytest.raises(CircularDependencyError):
-            engine.build_dependency_graph(circular_workflow)
-
-
-class TestPartialExecutionDataPreparation:
-    """Test data preparation for partial execution."""
-    
-    async def test_prepare_execution_data_with_input(self, partial_execution_engine):
-        """Test data preparation with provided input data."""
-        engine = partial_execution_engine
-        
-        input_data = {"key": "value", "number": 42}
-        
-        result = await engine.prepare_execution_data(
-            workflow_id="1",
-            start_node="node2",
-            input_data=input_data,
-            previous_execution_id=None
-        )
-        
-        assert result["node2"] == input_data
-    
-    async def test_prepare_execution_data_from_previous_execution(self, partial_execution_engine):
-        """Test data preparation from previous execution."""
-        engine = partial_execution_engine
-        
-        # Mock previous execution data
-        previous_data = {
-            "node1": [{"output": "data from node1"}],
-            "node2": [{"output": "data from node2"}]
-        }
-        engine.get_execution_results = AsyncMock(return_value=previous_data)
-        
-        result = await engine.prepare_execution_data(
-            workflow_id="1",
-            start_node="node2",
-            input_data=None,
-            previous_execution_id="prev-exec-123"
-        )
-        
-        # Should extract data relevant to node2
-        assert "node1" in result  # Previous node data available
-        engine.get_execution_results.assert_called_once_with("prev-exec-123")
-    
-    async def test_prepare_execution_data_empty_input(self, partial_execution_engine):
-        """Test data preparation with no input data."""
-        engine = partial_execution_engine
-        
-        result = await engine.prepare_execution_data(
-            workflow_id="1",
-            start_node="node2",
-            input_data=None,
-            previous_execution_id=None
-        )
-        
-        # Should create empty input for start node
-        assert result.get("node2") is None or result.get("node2") == []
-
-
-class TestPartialExecutionIntegration:
-    """Integration tests for partial execution."""
-    
-    async def test_execute_partial_simple_workflow(self, partial_execution_engine, sample_workflow):
-        """Test partial execution on simple workflow."""
-        engine = partial_execution_engine
-        
-        # Mock dependencies
-        engine.workflow_service.get_workflow.return_value = sample_workflow
-        engine.execution_service.create_execution.return_value = Mock(id="exec-123")
-        engine.execution_service.execute_nodes.return_value = {
-            "node3": [{"result": "success"}],
-            "node4": [{"result": "completed"}]
-        }
-        
-        input_data = {"test": "data"}
-        
-        result = await engine.execute_partial(
-            workflow_id="1",
-            start_node="node3",
-            input_data=input_data
-        )
-        
-        # Verify execution was created
-        engine.execution_service.create_execution.assert_called_once()
-        
-        # Verify correct nodes were executed
-        call_args = engine.execution_service.execute_nodes.call_args
-        executed_nodes = call_args[1]["nodes_to_execute"]
-        assert "node3" in executed_nodes
-        assert "node4" in executed_nodes
-        assert "node1" not in executed_nodes  # Should be skipped
-        assert "node2" not in executed_nodes  # Should be skipped
-    
-    async def test_execute_partial_with_dependencies(self, partial_execution_engine, complex_workflow):
-        """Test partial execution with complex dependencies."""
-        engine = partial_execution_engine
-        
-        # Mock dependencies
-        engine.workflow_service.get_workflow.return_value = complex_workflow
-        engine.execution_service.create_execution.return_value = Mock(id="exec-456")
-        engine.execution_service.execute_nodes.return_value = {
-            "merge": [{"merged": "data"}],
-            "final": [{"sent": "email"}]
-        }
-        
-        result = await engine.execute_partial(
-            workflow_id="2",
-            start_node="merge",
-            input_data={"branch1_data": "value1", "branch2_data": "value2"}
-        )
-        
-        # Verify only merge and final nodes were executed
-        call_args = engine.execution_service.execute_nodes.call_args
-        executed_nodes = call_args[1]["nodes_to_execute"]
-        assert executed_nodes == {"merge", "final"}
-    
-    async def test_execute_partial_with_previous_execution_data(self, partial_execution_engine, sample_workflow):
-        """Test partial execution using previous execution data."""
-        engine = partial_execution_engine
-        
-        # Mock dependencies
-        engine.workflow_service.get_workflow.return_value = sample_workflow
-        engine.execution_service.create_execution.return_value = Mock(id="exec-789")
-        engine.get_execution_results.return_value = {
-            "node1": [{"initial": "data"}],
-            "node2": [{"processed": "data"}]
-        }
-        
-        result = await engine.execute_partial(
-            workflow_id="1",
-            start_node="node3",
-            input_data=None,
-            previous_execution_id="prev-exec-456"
-        )
-        
-        # Verify previous execution data was retrieved
-        engine.get_execution_results.assert_called_once_with("prev-exec-456")
-
-
-class TestPartialExecutionErrorHandling:
-    """Test error handling in partial execution."""
-    
-    async def test_partial_execution_invalid_workflow(self, partial_execution_engine):
-        """Test error when workflow doesn't exist."""
-        engine = partial_execution_engine
-        
-        engine.workflow_service.get_workflow.return_value = None
-        
-        with pytest.raises(Exception) as exc_info:
-            await engine.execute_partial(
-                workflow_id="nonexistent",
-                start_node="node1"
+        nodes = []
+        for i, name in enumerate(["Node1", "Node2", "Node3"], 1):
+            node = WorkflowNode(
+                id=i,
+                workflow_id=3,
+                name=name,
+                type=NodeType.ACTION
             )
+            node.uuid = str(uuid4())
+            nodes.append(node)
         
-        assert "not found" in str(exc_info.value).lower()
+        # Create circular connections: 1 -> 2 -> 3 -> 1
+        connections = [
+            WorkflowConnection(id=1, workflow_id=3, source_node_id=1, target_node_id=2),
+            WorkflowConnection(id=2, workflow_id=3, source_node_id=2, target_node_id=3),
+            WorkflowConnection(id=3, workflow_id=3, source_node_id=3, target_node_id=1)  # Circular
+        ]
+        
+        workflow.workflow_nodes = nodes
+        workflow.workflow_connections = connections
+        
+        engine = WorkflowExecutionEngine(db_session)
+        
+        with patch.object(engine, '_load_workflow', return_value=workflow):
+            with pytest.raises(CircularDependencyError):
+                await engine.execute_partial_workflow(
+                    workflow_id=3,
+                    start_node_id=2,
+                    previous_node_data={"Node1": [{"data": "test"}]},
+                    mode=ExecutionMode.MANUAL
+                )
     
-    async def test_partial_execution_node_failure(self, partial_execution_engine, sample_workflow):
-        """Test handling of node execution failure."""
-        engine = partial_execution_engine
+    @pytest.mark.asyncio
+    async def test_partial_execution_preserves_execution_history(self, db_session, sample_workflow):
+        """Test that partial execution preserves execution history."""
+        engine = WorkflowExecutionEngine(db_session)
         
-        # Mock dependencies
-        engine.workflow_service.get_workflow.return_value = sample_workflow
-        engine.execution_service.create_execution.return_value = Mock(id="exec-fail")
-        engine.execution_service.execute_nodes.side_effect = Exception("Node execution failed")
+        mock_previous_data = {
+            "Process1": [{"data": "historical", "processed_by": "Start"}]
+        }
         
-        with pytest.raises(Exception) as exc_info:
-            await engine.execute_partial(
-                workflow_id="1",
-                start_node="node2"
-            )
+        with patch.object(engine, '_load_workflow', return_value=sample_workflow):
+            with patch.object(engine, '_create_workflow_execution') as mock_create:
+                with patch.object(engine, '_save_node_execution') as mock_save_node:
+                    mock_execution = MagicMock()
+                    mock_execution.id = 1
+                    mock_execution.uuid = uuid4()
+                    mock_create.return_value = mock_execution
+                    
+                    # Track saved node executions
+                    saved_executions = []
+                    mock_save_node.side_effect = lambda x: saved_executions.append(x)
+                    
+                    await engine.execute_partial_workflow(
+                        workflow_id=1,
+                        start_node_id=3,  # Process2
+                        previous_node_data=mock_previous_data,
+                        mode=ExecutionMode.MANUAL
+                    )
+                    
+                    # Verify historical data is preserved
+                    assert any(
+                        exec.is_historical == True 
+                        for exec in saved_executions 
+                        if exec.node_id == 2  # Process1
+                    )
+    
+    @pytest.mark.asyncio
+    async def test_partial_execution_with_run_data_override(self, db_session, sample_workflow):
+        """Test partial execution with custom run data for debugging."""
+        engine = WorkflowExecutionEngine(db_session)
         
-        assert "execution failed" in str(exc_info.value).lower()
+        # Custom data to inject at specific node
+        run_data_override = {
+            "Process2": [{"custom": "debug_data", "override": True}]
+        }
+        
+        with patch.object(engine, '_load_workflow', return_value=sample_workflow):
+            with patch.object(engine, '_execute_node') as mock_execute:
+                mock_execute.return_value = [{"processed": "data"}]
+                
+                await engine.execute_partial_workflow(
+                    workflow_id=1,
+                    start_node_id=3,  # Process2
+                    previous_node_data={},
+                    run_data_override=run_data_override,
+                    mode=ExecutionMode.MANUAL
+                )
+                
+                # Verify Process2 uses override data instead of executing
+                assert not any(
+                    call[0][0].id == 3  # Process2
+                    for call in mock_execute.call_args_list
+                )
+    
+    @pytest.mark.asyncio
+    async def test_partial_execution_skip_nodes_until_start(self, db_session, sample_workflow):
+        """Test that nodes before start node are skipped during partial execution."""
+        engine = WorkflowExecutionEngine(db_session)
+        
+        with patch.object(engine, '_load_workflow', return_value=sample_workflow):
+            with patch.object(engine, '_execute_node') as mock_execute:
+                mock_execute.return_value = [{"processed": "data"}]
+                
+                await engine.execute_partial_workflow(
+                    workflow_id=1,
+                    start_node_id=3,  # Process2
+                    previous_node_data={"Process1": [{"data": "test"}]},
+                    mode=ExecutionMode.MANUAL
+                )
+                
+                # Verify only nodes from Process2 onwards are executed
+                executed_node_ids = [call[0][0].id for call in mock_execute.call_args_list]
+                assert 1 not in executed_node_ids  # Start not executed
+                assert 2 not in executed_node_ids  # Process1 not executed
+                assert 3 in executed_node_ids      # Process2 executed
+                assert 4 in executed_node_ids      # Process3 executed
+                assert 5 in executed_node_ids      # End executed
 
 
 class TestPartialExecutionAPI:
-    """Test API integration for partial execution."""
+    """Test partial execution API endpoints."""
     
-    async def test_partial_execution_request_schema(self):
-        """Test partial execution request schema validation."""
-        # Valid request
-        request = PartialExecutionRequest(
-            start_node="node2",
-            input_data={"key": "value"},
-            previous_execution_id="exec-123"
+    @pytest.mark.asyncio
+    async def test_api_partial_execution_endpoint(self, client, sample_workflow):
+        """Test the partial execution API endpoint."""
+        request_data = {
+            "workflow_id": 1,
+            "start_node_id": 3,
+            "previous_node_data": {
+                "Process1": [{"data": "test"}]
+            }
+        }
+        
+        response = await client.post(
+            "/api/v1/executions/partial",
+            json=request_data
         )
         
-        assert request.start_node == "node2"
-        assert request.input_data == {"key": "value"}
-        assert request.previous_execution_id == "exec-123"
-        
-        # Minimal request
-        minimal_request = PartialExecutionRequest(start_node="node1")
-        assert minimal_request.start_node == "node1"
-        assert minimal_request.input_data is None
-        assert minimal_request.previous_execution_id is None
-
-
-class TestPartialExecutionPerformance:
-    """Test performance aspects of partial execution."""
+        assert response.status_code == 201
+        assert response.json()["execution_type"] == "partial"
+        assert response.json()["start_node"] == "Process2"
     
-    async def test_partial_execution_large_workflow(self, partial_execution_engine):
-        """Test partial execution performance on large workflow."""
-        # Create large workflow with many nodes
-        large_workflow = Workflow(
-            id=4,
-            name="Large Workflow",
-            nodes=[
-                {"id": f"node{i}", "name": f"Node {i}", "type": "http.request"}
-                for i in range(100)
-            ],
-            connections=[
-                {"source": f"node{i}", "target": f"node{i+1}"}
-                for i in range(99)
-            ]
+    @pytest.mark.asyncio
+    async def test_api_partial_execution_validation(self, client):
+        """Test API validation for partial execution."""
+        # Missing required fields
+        response = await client.post(
+            "/api/v1/executions/partial",
+            json={"workflow_id": 1}
         )
         
-        engine = partial_execution_engine
-        engine.workflow_service.get_workflow.return_value = large_workflow
-        
-        # Test dependency graph building performance
-        import time
-        start_time = time.time()
-        graph = engine.build_dependency_graph(large_workflow)
-        build_time = time.time() - start_time
-        
-        # Should build graph quickly (under 1 second for 100 nodes)
-        assert build_time < 1.0
-        
-        # Test node selection performance
-        start_time = time.time()
-        nodes_to_execute = engine.get_nodes_to_execute(graph, "node50")
-        selection_time = time.time() - start_time
-        
-        # Should select nodes quickly
-        assert selection_time < 0.1
-        assert len(nodes_to_execute) == 50  # node50 through node99
+        assert response.status_code == 422
+        assert "start_node_id" in response.json()["detail"][0]["loc"]
     
-    async def test_concurrent_partial_executions(self, partial_execution_engine, sample_workflow):
-        """Test concurrent partial executions."""
-        import asyncio
+    @pytest.mark.asyncio
+    async def test_api_get_node_dependencies(self, client, sample_workflow):
+        """Test getting node dependencies for partial execution."""
+        response = await client.get(
+            f"/api/v1/workflows/1/nodes/3/dependencies"
+        )
         
-        engine = partial_execution_engine
-        engine.workflow_service.get_workflow.return_value = sample_workflow
-        engine.execution_service.create_execution.return_value = Mock(id="concurrent-exec")
-        engine.execution_service.execute_nodes.return_value = {"node2": [{"result": "success"}]}
-        
-        # Create multiple concurrent partial executions
-        tasks = []
-        for i in range(5):
-            task = engine.execute_partial(
-                workflow_id="1",
-                start_node="node2",
-                input_data={"batch": i}
-            )
-            tasks.append(task)
-        
-        # Execute all concurrently
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        # All should complete successfully
-        assert len(results) == 5
-        for result in results:
-            assert not isinstance(result, Exception)
+        assert response.status_code == 200
+        dependencies = response.json()
+        assert "required_nodes" in dependencies
+        assert 2 in dependencies["required_nodes"]  # Process1 is required
+        assert "execution_order" in dependencies

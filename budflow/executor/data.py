@@ -131,6 +131,10 @@ class ExecutionData(BaseModel):
         """Get a context value."""
         return self.context_data.get(key, default)
     
+    def has_node_output(self, node_id: str, output_name: str = "main") -> bool:
+        """Check if a node has output data."""
+        return node_id in self.node_outputs and output_name in self.node_outputs[node_id]
+    
     def to_json(self) -> str:
         """Convert execution data to JSON string."""
         data = {
@@ -170,6 +174,22 @@ class ExecutionData(BaseModel):
             execution_id=data.get("execution_id"),
             started_at=datetime.fromisoformat(data["started_at"]) if data.get("started_at") else None,
         )
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert execution data to dictionary."""
+        return {
+            "node_outputs": {
+                node_id: {
+                    output_name: output.get_json()
+                    for output_name, output in outputs.items()
+                }
+                for node_id, outputs in self.node_outputs.items()
+            },
+            "context_data": self.context_data,
+            "input_data": self.input_data,
+            "execution_id": self.execution_id,
+            "started_at": self.started_at.isoformat() if self.started_at else None,
+        }
 
 
 class ExecutionMetrics(BaseModel):

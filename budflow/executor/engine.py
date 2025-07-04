@@ -2,9 +2,10 @@
 
 import asyncio
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import structlog
+import networkx as nx
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -21,9 +22,11 @@ from .errors import (
     WorkflowExecutionError,
     ExecutionTimeoutError,
     ExecutionCancelledError,
-    CircularDependencyError
+    CircularDependencyError,
+    InvalidStartNodeError
 )
 from .runner import NodeRunner
+from .directed_graph import DirectedGraphExecutor
 
 logger = structlog.get_logger()
 
@@ -34,6 +37,7 @@ class WorkflowExecutionEngine:
     def __init__(self, db_session: AsyncSession):
         self.db_session = db_session
         self.node_runner = NodeRunner()
+        self.directed_graph_executor = DirectedGraphExecutor(db_session)
         self.logger = logger.bind(component="execution_engine")
     
     async def execute_workflow(
@@ -177,8 +181,8 @@ class WorkflowExecutionEngine:
         result = await self.db_session.execute(
             select(Workflow)
             .options(
-                selectinload(Workflow.nodes),
-                selectinload(Workflow.connections)
+                selectinload(Workflow.workflow_nodes),
+                selectinload(Workflow.workflow_connections)
             )
             .where(Workflow.id == workflow_id)
         )
@@ -252,102 +256,174 @@ class WorkflowExecutionEngine:
             rec_stack.remove(node_id)
         
         # Check all nodes
-        for node in context.workflow.nodes:
+        for node in context.workflow.workflow_nodes:
             if node.id not in visited:
                 dfs(node.id, [])
         
         return cycles
     
     async def _execute_workflow_internal(self, context: ExecutionContext) -> None:
-        """Internal workflow execution logic."""
-        # Get start nodes (triggers or nodes with no incoming connections)
-        start_nodes = context.get_trigger_nodes() or context.get_start_nodes()
+        """Internal workflow execution logic using directed graph algorithm."""
+        # Create execution plan using directed graph executor
+        execution_plan = await self.directed_graph_executor.create_execution_plan(context.workflow)
         
-        if not start_nodes:
-            self.logger.warning("No start nodes found in workflow")
-            return
+        self.logger.info(
+            "Created execution plan",
+            execution_order=execution_plan.execution_order,
+            parallel_groups=len(execution_plan.parallel_groups),
+            critical_path_length=len(execution_plan.critical_path)
+        )
         
-        # Queue for nodes to execute
-        execution_queue: asyncio.Queue[WorkflowNode] = asyncio.Queue()
+        # Execute nodes according to the optimized plan
+        await self._execute_nodes_with_plan(context, execution_plan)
+    
+    async def _execute_nodes_with_plan(self, context: ExecutionContext, execution_plan) -> None:
+        """Execute nodes according to the directed graph execution plan."""
+        # Track executed nodes
+        executed_nodes: Set[int] = set()
         
-        # Add start nodes to queue
-        for node in start_nodes:
-            await execution_queue.put(node)
-        
-        # Track nodes in queue to avoid duplicates
-        queued_nodes: Set[int] = {node.id for node in start_nodes}
-        
-        # Execute nodes sequentially
-        while not execution_queue.empty():
+        # Execute parallel groups in order
+        for group in execution_plan.parallel_groups:
             # Check for cancellation
             context.check_cancelled()
             
-            # Get next node
-            node = await execution_queue.get()
+            if len(group) == 1:
+                # Single node - execute sequentially
+                node_id = group[0]
+                if node_id not in executed_nodes:
+                    node = context.get_node(node_id)
+                    if node and not node.disabled:
+                        await self._execute_single_node_with_dependencies(
+                            context, node, executed_nodes
+                        )
+                        executed_nodes.add(node_id)
+            else:
+                # Multiple nodes - execute in parallel
+                await self._execute_parallel_group(context, group, executed_nodes)
+    
+    async def _execute_single_node_with_dependencies(
+        self,
+        context: ExecutionContext,
+        node: WorkflowNode,
+        executed_nodes: Set[int]
+    ) -> None:
+        """Execute a single node after ensuring all dependencies are met."""
+        # Check if all dependencies are satisfied
+        incoming = context.get_incoming_connections(node.id)
+        for connection in incoming:
+            if connection.source_node_id not in executed_nodes:
+                source_node = context.get_node(connection.source_node_id)
+                if source_node and not source_node.disabled:
+                    # Dependency not met - this should not happen with proper planning
+                    self.logger.warning(
+                        "Dependency not met during execution",
+                        node_id=node.id,
+                        missing_dependency=connection.source_node_id
+                    )
+                    return
+        
+        # Execute the node
+        try:
+            await self._execute_node(context, node)
             
-            # Skip if already executed
-            if node.id in context.executed_nodes:
-                continue
+            # Mark as executed
+            context.mark_node_executed(node.id, success=True)
+            context.metrics.increment_executed()
+            context.metrics.increment_successful()
             
-            # Skip if dependencies not met
-            if not context.is_node_ready(node.id):
-                # Re-queue for later
-                await execution_queue.put(node)
-                continue
+        except Exception as e:
+            # Mark as failed
+            context.mark_node_executed(node.id, success=False)
+            context.metrics.increment_executed()
+            context.metrics.increment_failed()
             
-            # Execute node
+            # Log error
+            self.logger.error(
+                "Node execution failed",
+                node_id=node.id,
+                node_name=node.name,
+                error=str(e)
+            )
+            
+            # Decide whether to continue or fail workflow
+            if node.always_output_data:
+                # Continue with empty output
+                context.execution_data.set_node_output(
+                    str(node.id),
+                    [],
+                    "main"
+                )
+            else:
+                # Fail the workflow
+                raise WorkflowExecutionError(
+                    f"Workflow failed at node '{node.name}'",
+                    workflow_id=context.workflow.id,
+                    execution_id=context.workflow_execution.id,
+                    details={"node_id": node.id, "error": str(e)}
+                )
+    
+    async def _execute_parallel_group(
+        self,
+        context: ExecutionContext,
+        group: List[int],
+        executed_nodes: Set[int]
+    ) -> None:
+        """Execute a group of nodes in parallel."""
+        # Filter out already executed and disabled nodes
+        nodes_to_execute = []
+        for node_id in group:
+            if node_id not in executed_nodes:
+                node = context.get_node(node_id)
+                if node and not node.disabled:
+                    # Check if dependencies are met
+                    if self._are_dependencies_met(context, node_id, executed_nodes):
+                        nodes_to_execute.append(node)
+        
+        if not nodes_to_execute:
+            return
+        
+        self.logger.info(
+            "Executing parallel group",
+            group_size=len(nodes_to_execute),
+            node_ids=[n.id for n in nodes_to_execute]
+        )
+        
+        # Create tasks for parallel execution
+        tasks = []
+        for node in nodes_to_execute:
+            task = asyncio.create_task(
+                self._execute_single_node_with_dependencies(context, node, executed_nodes)
+            )
+            tasks.append((node.id, task))
+        
+        # Wait for all tasks to complete
+        for node_id, task in tasks:
             try:
-                await self._execute_node(context, node)
-                
-                # Mark as executed
-                context.mark_node_executed(node.id, success=True)
-                context.metrics.increment_executed()
-                context.metrics.increment_successful()
-                
-                # Queue next nodes
-                next_nodes = context.get_next_nodes(node.id)
-                for next_node in next_nodes:
-                    if next_node.id not in queued_nodes:
-                        await execution_queue.put(next_node)
-                        queued_nodes.add(next_node.id)
-                
+                await task
+                executed_nodes.add(node_id)
             except Exception as e:
-                # Mark as failed
-                context.mark_node_executed(node.id, success=False)
-                context.metrics.increment_executed()
-                context.metrics.increment_failed()
-                
-                # Log error
                 self.logger.error(
-                    "Node execution failed",
-                    node_id=node.id,
-                    node_name=node.name,
+                    "Parallel node execution failed",
+                    node_id=node_id,
                     error=str(e)
                 )
-                
-                # Decide whether to continue or fail workflow
-                if node.always_output_data:
-                    # Continue with empty output
-                    context.execution_data.set_node_output(
-                        str(node.id),
-                        [],
-                        "main"
-                    )
-                    
-                    # Still queue next nodes
-                    next_nodes = context.get_next_nodes(node.id)
-                    for next_node in next_nodes:
-                        if next_node.id not in queued_nodes:
-                            await execution_queue.put(next_node)
-                            queued_nodes.add(next_node.id)
-                else:
-                    # Fail the workflow
-                    raise WorkflowExecutionError(
-                        f"Workflow failed at node '{node.name}'",
-                        workflow_id=context.workflow.id,
-                        execution_id=context.workflow_execution.id,
-                        details={"node_id": node.id, "error": str(e)}
-                    )
+                # Continue with other nodes unless this is a critical failure
+                executed_nodes.add(node_id)  # Mark as executed even if failed
+    
+    def _are_dependencies_met(
+        self,
+        context: ExecutionContext,
+        node_id: int,
+        executed_nodes: Set[int]
+    ) -> bool:
+        """Check if all dependencies for a node are met."""
+        incoming = context.get_incoming_connections(node_id)
+        for connection in incoming:
+            if connection.source_node_id not in executed_nodes:
+                source_node = context.get_node(connection.source_node_id)
+                if source_node and not source_node.disabled:
+                    return False
+        return True
     
     async def _execute_node(
         self,
@@ -574,3 +650,412 @@ class WorkflowExecutionEngine:
             )
             
             raise
+    
+    async def execute_partial_workflow(
+        self,
+        workflow_id: int,
+        start_node_id: int,
+        previous_node_data: Dict[str, List[Dict[str, Any]]],
+        mode: ExecutionMode = ExecutionMode.MANUAL,
+        run_data_override: Optional[Dict[str, List[Dict[str, Any]]]] = None,
+        user_id: Optional[int] = None,
+        timeout_seconds: Optional[int] = None,
+    ) -> WorkflowExecution:
+        """
+        Execute workflow starting from a specific node (partial execution).
+        
+        Args:
+            workflow_id: ID of the workflow to execute
+            start_node_id: ID of the node to start execution from
+            previous_node_data: Output data from nodes that executed before the start node
+            mode: Execution mode
+            run_data_override: Optional data to override specific node outputs
+            user_id: User ID initiating the execution
+            timeout_seconds: Optional timeout for the execution
+            
+        Returns:
+            WorkflowExecution record
+        """
+        self.logger.info(
+            "Starting partial workflow execution",
+            workflow_id=workflow_id,
+            start_node_id=start_node_id,
+            mode=mode.value
+        )
+        
+        # Load workflow
+        workflow = await self._load_workflow(workflow_id)
+        if not workflow:
+            raise WorkflowExecutionError(
+                f"Workflow {workflow_id} not found",
+                workflow_id=workflow_id
+            )
+        
+        # Validate start node exists
+        start_node = next((n for n in workflow.workflow_nodes if n.id == start_node_id), None)
+        if not start_node:
+            raise InvalidStartNodeError(
+                f"Node {start_node_id} not found in workflow {workflow_id}",
+                node_id=start_node_id,
+                workflow_id=workflow_id
+            )
+        
+        # Build partial execution graph using directed graph executor
+        partial_execution_plan = await self.directed_graph_executor.create_subgraph_execution_plan(
+            workflow=workflow,
+            start_nodes=[start_node_id]
+        )
+        
+        # Validate required input data is present
+        await self._validate_partial_execution_inputs(
+            workflow, start_node_id, previous_node_data, partial_execution_plan
+        )
+        
+        # Create workflow execution record with partial flag
+        workflow_execution = await self._create_partial_workflow_execution(
+            workflow=workflow,
+            mode=mode,
+            input_data={"previous_node_data": previous_node_data},
+            user_id=user_id,
+            execution_type="partial",
+            start_node=start_node.name
+        )
+        
+        # Create execution context
+        execution_data = ExecutionData(
+            execution_id=workflow_execution.uuid,
+            input_data=previous_node_data,
+            started_at=datetime.now(timezone.utc)
+        )
+        
+        # Pre-populate execution data with previous node outputs
+        for node_name, data in previous_node_data.items():
+            # Find node by name to get ID
+            node = next((n for n in workflow.workflow_nodes if n.name == node_name), None)
+            if node:
+                execution_data.set_node_output(str(node.id), data, "main")
+        
+        # Apply run data overrides if provided
+        if run_data_override:
+            for node_name, data in run_data_override.items():
+                node = next((n for n in workflow.workflow_nodes if n.name == node_name), None)
+                if node:
+                    execution_data.set_node_output(str(node.id), data, "main")
+        
+        context = ExecutionContext(
+            workflow=workflow,
+            workflow_execution=workflow_execution,
+            db_session=self.db_session,
+            execution_data=execution_data,
+            timeout_seconds=timeout_seconds
+        )
+        
+        try:
+            # Initialize context
+            await context.initialize()
+            
+            # Mark nodes before start node as already executed (historical)
+            nodes_before_start = await self._get_nodes_before_start(
+                workflow, start_node_id, partial_execution_plan
+            )
+            
+            for node_id in nodes_before_start:
+                context.mark_node_executed(node_id, success=True)
+                
+                # Create historical node execution records
+                node = next(n for n in workflow.workflow_nodes if n.id == node_id)
+                await self._save_node_execution(
+                    context=context,
+                    node=node,
+                    is_historical=True,
+                    data=previous_node_data.get(node.name, [])
+                )
+            
+            # Execute partial workflow
+            workflow_execution.status = ExecutionStatus.RUNNING
+            workflow_execution.started_at = datetime.now(timezone.utc)
+            await self.db_session.commit()
+            
+            if timeout_seconds:
+                await asyncio.wait_for(
+                    self._execute_partial_workflow_internal(context, start_node_id, partial_execution_plan),
+                    timeout=timeout_seconds
+                )
+            else:
+                await self._execute_partial_workflow_internal(context, start_node_id, partial_execution_plan)
+            
+            # Mark as successful
+            context.status = ExecutionStatus.SUCCESS
+            workflow_execution.status = ExecutionStatus.SUCCESS
+            
+        except Exception as e:
+            self.logger.error(
+                "Partial workflow execution failed",
+                workflow_id=workflow_id,
+                start_node_id=start_node_id,
+                execution_id=workflow_execution.uuid,
+                error=str(e)
+            )
+            
+            context.error = e
+            context.status = ExecutionStatus.ERROR
+            workflow_execution.status = ExecutionStatus.ERROR
+            raise
+        
+        finally:
+            # Save final state
+            await context.save_execution_state()
+            await self.db_session.commit()
+            
+            self.logger.info(
+                "Partial workflow execution completed",
+                workflow_id=workflow_id,
+                start_node_id=start_node_id,
+                execution_id=workflow_execution.uuid,
+                status=context.status.value
+            )
+        
+        return workflow_execution
+    
+    async def _build_partial_execution_graph(
+        self,
+        workflow: Workflow,
+        start_node_id: int
+    ) -> nx.DiGraph:
+        """Build execution graph starting from specific node."""
+        graph = nx.DiGraph()
+        
+        # Add all nodes
+        for node in workflow.workflow_nodes:
+            graph.add_node(node.id, data=node)
+        
+        # Add all connections
+        for conn in workflow.workflow_connections:
+            graph.add_edge(
+                conn.source_node_id,
+                conn.target_node_id,
+                data=conn
+            )
+        
+        # Find all nodes reachable from start node
+        reachable_nodes = nx.descendants(graph, start_node_id)
+        reachable_nodes.add(start_node_id)
+        
+        # Create subgraph with only reachable nodes
+        partial_graph = graph.subgraph(reachable_nodes).copy()
+        
+        # Check for cycles in partial graph
+        if not nx.is_directed_acyclic_graph(partial_graph):
+            cycles = list(nx.simple_cycles(partial_graph))
+            if cycles:
+                raise CircularDependencyError(
+                    f"Circular dependency detected in partial execution graph",
+                    cycle_path=cycles[0]
+                )
+        
+        return partial_graph
+    
+    async def _validate_partial_execution_inputs(
+        self,
+        workflow: Workflow,
+        start_node_id: int,
+        previous_node_data: Dict[str, List[Dict[str, Any]]],
+        partial_execution_plan: Dict[str, Any]
+    ) -> None:
+        """Validate that required input data is present for partial execution."""
+        # Build full graph to check dependencies
+        full_graph = await self.directed_graph_executor.build_execution_graph(workflow)
+        
+        # Get immediate predecessors of start node
+        predecessors = list(full_graph.predecessors(start_node_id))
+        
+        if predecessors:
+            # Map node IDs to names
+            node_id_to_name = {n.id: n.name for n in workflow.workflow_nodes}
+            
+            # Check if we have data for required predecessors
+            missing_inputs = []
+            for pred_id in predecessors:
+                pred_name = node_id_to_name.get(pred_id, f"Node_{pred_id}")
+                if pred_name not in previous_node_data:
+                    missing_inputs.append(pred_name)
+            
+            if missing_inputs:
+                raise WorkflowExecutionError(
+                    f"Missing required input data from nodes: {', '.join(missing_inputs)}",
+                    workflow_id=workflow.id,
+                    error_code="MISSING_INPUT_DATA"
+                )
+    
+    async def _get_nodes_before_start(
+        self,
+        workflow: Workflow,
+        start_node_id: int,
+        partial_execution_plan: Dict[str, Any]
+    ) -> Set[int]:
+        """Get all nodes that execute before the start node."""
+        # Build full workflow graph
+        full_graph = await self.directed_graph_executor.build_execution_graph(workflow)
+        
+        # Find all ancestors of start node
+        ancestors = nx.ancestors(full_graph, start_node_id)
+        
+        return ancestors
+    
+    async def _save_node_execution(
+        self,
+        context: ExecutionContext,
+        node: WorkflowNode,
+        is_historical: bool = False,
+        data: Optional[List[Dict[str, Any]]] = None
+    ) -> NodeExecution:
+        """Save node execution record."""
+        # For historical nodes (executed before partial execution start),
+        # we create a record showing they were already completed
+        node_execution = NodeExecution(
+            workflow_execution_id=context.workflow_execution.id,
+            node_id=node.id,
+            status=NodeExecutionStatus.SUCCESS if is_historical else NodeExecutionStatus.NEW,
+            started_at=datetime.now(timezone.utc) if not is_historical else None,
+            finished_at=datetime.now(timezone.utc) if is_historical else None,
+            output_data={"items": data or [], "count": len(data or [])} if is_historical else None,
+            duration_ms=0 if is_historical else None
+        )
+        
+        self.db_session.add(node_execution)
+        await self.db_session.commit()
+        await self.db_session.refresh(node_execution)
+        
+        return node_execution
+    
+    async def _execute_partial_workflow_internal(
+        self,
+        context: ExecutionContext,
+        start_node_id: int,
+        partial_execution_plan: Dict[str, Any]
+    ) -> None:
+        """Execute partial workflow starting from specific node using optimized plan."""
+        # Get the execution order from the plan
+        execution_order = partial_execution_plan.get("execution_order", [])
+        parallel_groups = partial_execution_plan.get("parallel_groups", [])
+        
+        # Track executed nodes
+        executed_nodes: Set[int] = set()
+        
+        # Execute nodes according to the partial execution plan
+        if parallel_groups:
+            # Use parallel group execution
+            for group in parallel_groups:
+                # Check for cancellation
+                context.check_cancelled()
+                
+                if len(group) == 1:
+                    # Single node
+                    node_id = group[0]
+                    if node_id not in executed_nodes:
+                        await self._execute_partial_node(context, node_id, executed_nodes)
+                        executed_nodes.add(node_id)
+                else:
+                    # Parallel group
+                    await self._execute_partial_parallel_group(context, group, executed_nodes)
+        else:
+            # Fall back to sequential execution based on order
+            for node_id in execution_order:
+                context.check_cancelled()
+                if node_id not in executed_nodes:
+                    await self._execute_partial_node(context, node_id, executed_nodes)
+                    executed_nodes.add(node_id)
+    
+    async def _execute_partial_node(
+        self,
+        context: ExecutionContext,
+        node_id: int,
+        executed_nodes: Set[int]
+    ) -> None:
+        """Execute a single node in partial workflow execution."""
+        # Get node
+        node = next((n for n in context.workflow.workflow_nodes if n.id == node_id), None)
+        if not node or node.disabled:
+            return
+        
+        # Check if node has override data
+        if context.execution_data.has_node_output(str(node_id)):
+            # Node has override data, mark as executed
+            context.mark_node_executed(node_id, success=True)
+            self.logger.info(
+                f"Skipping node {node.name} - using override data"
+            )
+        else:
+            # Execute node normally
+            await self._execute_single_node_with_dependencies(context, node, executed_nodes)
+    
+    async def _execute_partial_parallel_group(
+        self,
+        context: ExecutionContext,
+        group: List[int],
+        executed_nodes: Set[int]
+    ) -> None:
+        """Execute a group of nodes in parallel during partial execution."""
+        # Filter nodes that need execution
+        nodes_to_execute = []
+        for node_id in group:
+            if node_id not in executed_nodes:
+                node = next((n for n in context.workflow.workflow_nodes if n.id == node_id), None)
+                if node and not node.disabled:
+                    nodes_to_execute.append(node)
+        
+        if not nodes_to_execute:
+            return
+        
+        # Execute nodes in parallel
+        tasks = []
+        for node in nodes_to_execute:
+            task = asyncio.create_task(
+                self._execute_partial_node(context, node.id, executed_nodes)
+            )
+            tasks.append((node.id, task))
+        
+        # Wait for completion
+        for node_id, task in tasks:
+            try:
+                await task
+                executed_nodes.add(node_id)
+            except Exception as e:
+                self.logger.error(
+                    "Partial parallel execution failed",
+                    node_id=node_id,
+                    error=str(e)
+                )
+                executed_nodes.add(node_id)  # Mark as executed even if failed
+    
+    async def _create_partial_workflow_execution(
+        self,
+        workflow: Workflow,
+        mode: ExecutionMode,
+        input_data: Optional[Dict[str, Any]],
+        user_id: Optional[int],
+        parent_execution: Optional[WorkflowExecution] = None,
+        execution_depth: int = 0,
+        execution_stack: Optional[List[int]] = None,
+        execution_type: str = "full",
+        start_node: Optional[str] = None
+    ) -> WorkflowExecution:
+        """Create workflow execution record with partial execution support."""
+        workflow_execution = WorkflowExecution(
+            workflow_id=workflow.id,
+            user_id=user_id,
+            mode=mode,
+            status=ExecutionStatus.NEW,
+            data=input_data,
+            parent_execution_id=parent_execution.id if parent_execution else None,
+            execution_depth=execution_depth,
+            execution_stack=execution_stack or [],
+            execution_type=execution_type,
+            start_node=start_node
+        )
+        
+        self.db_session.add(workflow_execution)
+        await self.db_session.commit()
+        await self.db_session.refresh(workflow_execution)
+        
+        return workflow_execution

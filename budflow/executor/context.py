@@ -134,11 +134,11 @@ class ExecutionContext:
     async def initialize(self) -> None:
         """Initialize execution context."""
         # Build node index
-        for node in self.workflow.nodes:
+        for node in self.workflow.workflow_nodes:
             self.nodes_by_id[node.id] = node
         
         # Build connection indices
-        for connection in self.workflow.connections:
+        for connection in self.workflow.workflow_connections:
             # Index by target
             if connection.target_node_id not in self.connections_by_target:
                 self.connections_by_target[connection.target_node_id] = []
@@ -164,14 +164,14 @@ class ExecutionContext:
     def get_trigger_nodes(self) -> List[WorkflowNode]:
         """Get all trigger nodes in workflow."""
         return [
-            node for node in self.workflow.nodes
+            node for node in self.workflow.workflow_nodes
             if node.is_trigger_node and not node.disabled
         ]
     
     def get_start_nodes(self) -> List[WorkflowNode]:
         """Get nodes with no incoming connections (start nodes)."""
         start_nodes = []
-        for node in self.workflow.nodes:
+        for node in self.workflow.workflow_nodes:
             if not node.disabled and node.id not in self.connections_by_target:
                 start_nodes.append(node)
         return start_nodes

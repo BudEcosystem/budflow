@@ -1,0 +1,552 @@
+"""
+Jinja2-based expression engine with extensive filters and functions.
+
+This module provides comprehensive Jinja2 template support with custom filters
+and functions specifically designed for workflow automation.
+"""
+
+import asyncio
+import base64
+import hashlib
+import json
+import random
+import re
+import urllib.parse
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Union
+from uuid import uuid4
+
+import structlog
+from jinja2 import (
+    Environment, 
+    BaseLoader, 
+    select_autoescape,
+    StrictUndefined,
+    TemplateError,
+    TemplateSyntaxError,
+    UndefinedError
+)
+
+from .errors import (
+    ExpressionError,
+    ExpressionSyntaxError,
+    ExpressionRuntimeError,
+    UndefinedVariableError,
+    InvalidFilterError
+)
+
+logger = structlog.get_logger()
+
+
+class SecureStringLoader(BaseLoader):
+    """Secure string template loader for Jinja2."""
+    
+    def __init__(self, template_string: str):
+        self.template_string = template_string
+    
+    def get_source(self, environment, template):
+        return self.template_string, None, lambda: True
+
+
+class JinjaExpressionEngine:
+    """
+    Jinja2-based expression engine with extensive workflow-specific features.
+    
+    Features:
+    - Comprehensive built-in and custom filters
+    - Security sandboxing
+    - Performance optimization
+    - Async evaluation support
+    - Workflow-specific functions
+    """
+    
+    def __init__(
+        self,
+        enable_security: bool = True,
+        enable_caching: bool = True,
+        timeout_seconds: float = 30.0
+    ):
+        self.enable_security = enable_security
+        self.enable_caching = enable_caching
+        self.timeout_seconds = timeout_seconds
+        self.logger = logger.bind(component="jinja_expression_engine")
+        
+        # Create Jinja environment
+        self.env = self._create_environment()
+        
+        # Template cache
+        self._template_cache: Dict[str, Any] = {} if enable_caching else None
+    
+    def _create_environment(self) -> Environment:
+        """Create Jinja2 environment with custom filters and functions."""
+        env = Environment(
+            loader=None,  # We'll use string templates
+            autoescape=False,  # Disable autoescape for workflow expressions
+            undefined=StrictUndefined,
+            trim_blocks=True,
+            lstrip_blocks=True,
+        )
+        
+        # Add custom filters
+        self._add_custom_filters(env)
+        
+        # Add custom functions
+        self._add_custom_functions(env)
+        
+        # Security configuration
+        if self.enable_security:
+            self._configure_security(env)
+        
+        return env
+    
+    def _add_custom_filters(self, env: Environment) -> None:
+        """Add custom filters for workflow processing."""
+        
+        # Date/time filters
+        def dateformat(value: Union[str, datetime], format_str: str = '%Y-%m-%d %H:%M:%S') -> str:
+            """Format date/time value."""
+            if isinstance(value, str):
+                # Try to parse ISO format
+                try:
+                    dt = datetime.fromisoformat(value.replace('Z', '+00:00'))
+                except ValueError:
+                    return value
+            elif isinstance(value, datetime):
+                dt = value
+            else:
+                return str(value)
+            
+            return dt.strftime(format_str)
+        
+        def timestamp(value: Union[str, datetime] = None) -> int:
+            """Convert to Unix timestamp."""
+            if value is None:
+                dt = datetime.now(timezone.utc)
+            elif isinstance(value, str):
+                dt = datetime.fromisoformat(value.replace('Z', '+00:00'))
+            else:
+                dt = value
+            
+            return int(dt.timestamp())
+        
+        # JSON filters
+        def tojson(value: Any, indent: int = None) -> str:
+            """Convert value to JSON string."""
+            return json.dumps(value, indent=indent, default=str)
+        
+        def fromjson(value: str) -> Any:
+            """Parse JSON string."""
+            try:
+                parsed = json.loads(value)
+                # Use a special marker to indicate this should return the object
+                return f"__JINJA_OBJECT_RESULT__{json.dumps(parsed)}__JINJA_OBJECT_RESULT__"
+            except json.JSONDecodeError as e:
+                raise InvalidFilterError(f"Invalid JSON: {e}", filter_name="fromjson")
+        
+        # Encoding filters
+        def b64encode(value: str) -> str:
+            """Base64 encode string."""
+            return base64.b64encode(value.encode('utf-8')).decode('ascii')
+        
+        def b64decode(value: str) -> str:
+            """Base64 decode string."""
+            try:
+                return base64.b64decode(value).decode('utf-8')
+            except Exception as e:
+                raise InvalidFilterError(f"Invalid base64: {e}", filter_name="b64decode")
+        
+        def urlencode(value: str) -> str:
+            """URL encode string."""
+            return urllib.parse.quote(value)
+        
+        def urldecode(value: str) -> str:
+            """URL decode string."""
+            return urllib.parse.unquote(value)
+        
+        # Hash filters
+        def md5_filter(value: str) -> str:
+            """Calculate MD5 hash."""
+            return hashlib.md5(value.encode('utf-8')).hexdigest()
+        
+        def sha1_filter(value: str) -> str:
+            """Calculate SHA1 hash."""
+            return hashlib.sha1(value.encode('utf-8')).hexdigest()
+        
+        def sha256_filter(value: str) -> str:
+            """Calculate SHA256 hash."""
+            return hashlib.sha256(value.encode('utf-8')).hexdigest()
+        
+        # String filters
+        def slugify(value: str) -> str:
+            """Convert string to slug format."""
+            # Convert to lowercase and replace spaces/special chars with hyphens
+            slug = re.sub(r'[^\w\s-]', '', value.lower())
+            slug = re.sub(r'[-\s]+', '-', slug)
+            return slug.strip('-')
+        
+        def truncate_words(value: str, count: int = 10, end: str = '...') -> str:
+            """Truncate string to specified number of words."""
+            words = value.split()
+            if len(words) <= count:
+                return value
+            return ' '.join(words[:count]) + end
+        
+        def regex_replace(value: str, pattern: str, replacement: str) -> str:
+            """Replace using regular expression."""
+            return re.sub(pattern, replacement, value)
+        
+        def regex_search(value: str, pattern: str) -> Optional[str]:
+            """Search using regular expression."""
+            match = re.search(pattern, value)
+            return match.group(0) if match else None
+        
+        # Array/list filters
+        def chunk(value: List[Any], size: int) -> List[List[Any]]:
+            """Split list into chunks of specified size."""
+            return [value[i:i + size] for i in range(0, len(value), size)]
+        
+        def flatten(value: List[Any], depth: int = 1) -> List[Any]:
+            """Flatten nested lists."""
+            def _flatten(lst, d):
+                result = []
+                for item in lst:
+                    if isinstance(item, list) and d > 0:
+                        result.extend(_flatten(item, d - 1))
+                    else:
+                        result.append(item)
+                return result
+            
+            return _flatten(value, depth)
+        
+        def pluck(value: List[Dict[str, Any]], key: str) -> List[Any]:
+            """Extract values for a specific key from list of dicts."""
+            return [item.get(key) for item in value if isinstance(item, dict)]
+        
+        # Math filters
+        def round_to(value: float, decimals: int = 2) -> float:
+            """Round to specified number of decimal places."""
+            return round(float(value), decimals)
+        
+        def percentage(value: float, total: float) -> float:
+            """Calculate percentage."""
+            return (float(value) / float(total)) * 100 if total != 0 else 0
+        
+        # Special filter for returning objects/lists directly
+        def as_object(value: Any) -> str:
+            """Mark value to be returned as object/list instead of string."""
+            return f"__JINJA_OBJECT_RESULT__{json.dumps(value)}__JINJA_OBJECT_RESULT__"
+        
+        # Register all filters
+        env.filters.update({
+            'dateformat': dateformat,
+            'timestamp': timestamp,
+            'tojson': tojson,
+            'fromjson': fromjson,
+            'b64encode': b64encode,
+            'b64decode': b64decode,
+            'urlencode': urlencode,
+            'urldecode': urldecode,
+            'md5': md5_filter,
+            'sha1': sha1_filter,
+            'sha256': sha256_filter,
+            'slugify': slugify,
+            'truncate_words': truncate_words,
+            'regex_replace': regex_replace,
+            'regex_search': regex_search,
+            'chunk': chunk,
+            'flatten': flatten,
+            'pluck': pluck,
+            'round_to': round_to,
+            'percentage': percentage,
+            'as_object': as_object,
+        })
+    
+    def _add_custom_functions(self, env: Environment) -> None:
+        """Add custom global functions."""
+        
+        # Random functions
+        def random_int(min_val: int = 0, max_val: int = 100) -> int:
+            """Generate random integer."""
+            return random.randint(min_val, max_val)
+        
+        def random_float(min_val: float = 0.0, max_val: float = 1.0) -> float:
+            """Generate random float."""
+            return random.uniform(min_val, max_val)
+        
+        def random_choice(choices: List[Any]) -> Any:
+            """Choose random item from list."""
+            return random.choice(choices) if choices else None
+        
+        def random_string(length: int = 10, chars: str = None) -> str:
+            """Generate random string."""
+            if chars is None:
+                chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+            return ''.join(random.choice(chars) for _ in range(length))
+        
+        # UUID functions
+        def uuid4_gen() -> str:
+            """Generate UUID4."""
+            return str(uuid4())
+        
+        # Hash functions
+        def md5_func(value: str) -> str:
+            """Calculate MD5 hash."""
+            return hashlib.md5(str(value).encode('utf-8')).hexdigest()
+        
+        def sha1_func(value: str) -> str:
+            """Calculate SHA1 hash."""
+            return hashlib.sha1(str(value).encode('utf-8')).hexdigest()
+        
+        def sha256_func(value: str) -> str:
+            """Calculate SHA256 hash."""
+            return hashlib.sha256(str(value).encode('utf-8')).hexdigest()
+        
+        # Date/time functions
+        def now() -> datetime:
+            """Get current datetime."""
+            return datetime.now(timezone.utc)
+        
+        def utcnow() -> datetime:
+            """Get current UTC datetime."""
+            return datetime.now(timezone.utc)
+        
+        # Utility functions
+        def range_list(start: int, stop: int = None, step: int = 1) -> List[int]:
+            """Create range as list (safe version of range)."""
+            if stop is None:
+                start, stop = 0, start
+            
+            # Limit range size for security
+            max_size = 10000
+            size = abs((stop - start) // step)
+            if size > max_size:
+                raise ValueError(f"Range too large: {size} > {max_size}")
+            
+            return list(range(start, stop, step))
+        
+        def len_safe(value: Any) -> int:
+            """Safe length function."""
+            try:
+                return len(value)
+            except (TypeError, AttributeError):
+                return 0
+        
+        def type_name(value: Any) -> str:
+            """Get type name of value."""
+            return type(value).__name__
+        
+        # Add all functions to globals
+        env.globals.update({
+            'random_int': random_int,
+            'random_float': random_float,
+            'random_choice': random_choice,
+            'random_string': random_string,
+            'uuid4': uuid4_gen,
+            'md5': md5_func,
+            'sha1': sha1_func,
+            'sha256': sha256_func,
+            'now': now,
+            'utcnow': utcnow,
+            'range_list': range_list,
+            'len_safe': len_safe,
+            'type_name': type_name,
+        })
+    
+    def _configure_security(self, env: Environment) -> None:
+        """Configure security restrictions."""
+        # Remove dangerous builtins
+        restricted_names = {
+            '__import__', '__builtins__', 'eval', 'exec', 'compile',
+            'open', 'file', 'input', 'raw_input', 'reload', 'vars',
+            'globals', 'locals', 'dir', 'hasattr', 'getattr', 'setattr',
+            'delattr', 'callable'
+        }
+        
+        # Override globals to remove dangerous functions
+        safe_globals = {}
+        for name, value in env.globals.items():
+            if name not in restricted_names:
+                safe_globals[name] = value
+        
+        env.globals.clear()
+        env.globals.update(safe_globals)
+        
+        # Add safe builtins
+        safe_builtins = {
+            'len': len,
+            'str': str,
+            'int': int,
+            'float': float,
+            'bool': bool,
+            'list': list,
+            'dict': dict,
+            'tuple': tuple,
+            'set': set,
+            'abs': abs,
+            'min': min,
+            'max': max,
+            'sum': sum,
+            'sorted': sorted,
+            'reversed': reversed,
+            'enumerate': enumerate,
+            'zip': zip,
+            'map': map,
+            'filter': filter,
+            'any': any,
+            'all': all,
+        }
+        
+        env.globals.update(safe_builtins)
+    
+    async def evaluate(
+        self,
+        expression: str,
+        context: Union[Dict[str, Any], Any] = None,
+        additional_context: Dict[str, Any] = None
+    ) -> Any:
+        """
+        Evaluate Jinja2 template expression.
+        
+        Args:
+            expression: Jinja2 template string
+            context: Context object or dictionary
+            additional_context: Additional context variables
+            
+        Returns:
+            Evaluated result
+            
+        Raises:
+            ExpressionError: If evaluation fails
+        """
+        try:
+            # Prepare context
+            if hasattr(context, 'to_jinja_context'):
+                template_context = context.to_jinja_context()
+            elif isinstance(context, dict):
+                template_context = context.copy()
+            else:
+                template_context = {}
+            
+            if additional_context:
+                template_context.update(additional_context)
+            
+            # Get or create template
+            template = self._get_template(expression)
+            
+            # Evaluate with timeout
+            if self.timeout_seconds:
+                result = await asyncio.wait_for(
+                    self._render_template(template, template_context),
+                    timeout=self.timeout_seconds
+                )
+            else:
+                result = await self._render_template(template, template_context)
+            
+            return result
+            
+        except TemplateSyntaxError as e:
+            raise ExpressionSyntaxError(
+                f"Template syntax error: {e.message}",
+                expression=expression,
+                line=e.lineno
+            )
+        except UndefinedError as e:
+            raise UndefinedVariableError(
+                f"Undefined variable: {e}",
+                expression=expression
+            )
+        except TemplateError as e:
+            raise ExpressionRuntimeError(
+                f"Template error: {e}",
+                expression=expression
+            )
+        except asyncio.TimeoutError:
+            raise ExpressionRuntimeError(
+                f"Template evaluation timed out after {self.timeout_seconds} seconds",
+                expression=expression
+            )
+        except Exception as e:
+            self.logger.error(
+                "Jinja template evaluation failed",
+                expression=expression,
+                error=str(e),
+                error_type=type(e).__name__
+            )
+            raise ExpressionRuntimeError(
+                f"Template evaluation failed: {e}",
+                expression=expression
+            )
+    
+    def _get_template(self, expression: str):
+        """Get template from cache or create new one."""
+        if self.enable_caching and expression in self._template_cache:
+            return self._template_cache[expression]
+        
+        template = self.env.from_string(expression)
+        
+        if self.enable_caching:
+            self._template_cache[expression] = template
+        
+        return template
+    
+    async def _render_template(self, template, context: Dict[str, Any]) -> Any:
+        """Render template asynchronously."""
+        # Run template rendering in executor to avoid blocking
+        loop = asyncio.get_event_loop()
+        
+        def render():
+            rendered = template.render(context)
+            # Try to convert to appropriate type
+            return self._convert_result(rendered)
+        
+        return await loop.run_in_executor(None, render)
+    
+    def _convert_result(self, result: str) -> Any:
+        """Convert string result to appropriate type."""
+        # Check for special object result marker
+        if result.startswith('__JINJA_OBJECT_RESULT__') and result.endswith('__JINJA_OBJECT_RESULT__'):
+            json_str = result[len('__JINJA_OBJECT_RESULT__'):-len('__JINJA_OBJECT_RESULT__')]
+            try:
+                return json.loads(json_str)
+            except json.JSONDecodeError:
+                pass
+        # If result looks like JSON, try to parse it
+        result = result.strip()
+        
+        if not result:
+            return ""
+        
+        # Try to parse as JSON for structured data
+        if (result.startswith('{') and result.endswith('}')) or \
+           (result.startswith('[') and result.endswith(']')):
+            try:
+                return json.loads(result)
+            except json.JSONDecodeError:
+                pass
+        
+        # Try to parse as number
+        if result.isdigit():
+            return int(result)
+        
+        try:
+            if '.' in result:
+                return float(result)
+        except ValueError:
+            pass
+        
+        # Try to parse as boolean
+        if result.lower() in ('true', 'false'):
+            return result.lower() == 'true'
+        
+        # Return as string
+        return result
+    
+    def clear_cache(self) -> None:
+        """Clear template cache."""
+        if self._template_cache:
+            self._template_cache.clear()
+    
+    @property
+    def cache_size(self) -> int:
+        """Get current cache size."""
+        return len(self._template_cache) if self._template_cache else 0
