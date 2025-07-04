@@ -13,11 +13,10 @@ from budflow.config import settings
 from budflow.database import Base, get_postgres_session, db_manager
 
 
-# Override settings for testing
-settings.database_url = "sqlite+aiosqlite:///./test_budflow.db"
-settings.test_database_url = "sqlite+aiosqlite:///./test_budflow.db"
-settings.environment = "testing"
-settings.debug = True
+import os
+
+os.environ["ENV_FILE"] = ".env.test"
+
 
 
 @pytest.fixture(scope="session")

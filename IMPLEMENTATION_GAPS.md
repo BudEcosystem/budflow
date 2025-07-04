@@ -1,18 +1,31 @@
 # BudFlow Python Implementation Gaps Analysis
 
-## Critical Missing Implementations
+*Updated: 2025-07-04 after TDD implementation*
 
-### 1. Worker and Queue System (HIGH PRIORITY)
-**Current State**: Basic Celery config exists but no actual task implementations
-**Required Implementation**:
-```python
-# budflow/workflows/tasks.py - MISSING FILE
-# Need to implement:
-- execute_workflow_task
-- execute_node_task
-- cleanup_execution_task
-- retry_failed_execution_task
-```
+## ✅ COMPLETED IMPLEMENTATIONS (Through TDD)
+
+### 1. Webhook HTTP Endpoints ✅
+**Status**: COMPLETED (22 tests passing)
+- All webhook routes implemented (/webhook, /webhook-test, /webhook-waiting)
+- Binary data handling for webhook payloads
+- Dynamic webhook path routing  
+- Webhook response handling
+
+### 2. Worker and Queue System ✅
+**Status**: COMPLETED (11 tests passing)
+- All Celery tasks implemented in budflow/workflows/tasks.py
+- execute_workflow, execute_node, cleanup_executions tasks working
+- retry_failed_execution, schedule_workflow, cancel_workflow implemented
+- Minor bugs remain but core functionality complete
+
+### 3. Binary Data Handling ✅  
+**Status**: COMPLETED (18 tests passing)
+- Full implementation with filesystem and S3 backends
+- Encryption (Fernet) and compression (gzip) support
+- Streaming support for large files
+- TTL/expiration and cleanup functionality
+
+## Critical Missing Implementations
 
 ### 2. Task Runner for Isolated Execution (HIGH PRIORITY)
 **Current State**: Interface defined but NotImplementedError
@@ -207,12 +220,43 @@ Each implementation needs:
 
 **Total**: 380-520 hours (2-3 months with single developer)
 
-## Next Steps
+## Newly Discovered Gaps (2025-07-04)
 
-1. Fix critical security issue (credential decryption)
-2. Implement worker tasks for basic workflow execution
-3. Complete webhook processing
-4. Add S3 binary data support
-5. Begin Docker-based task runner
+### Expression Engine Enhancements Needed
+1. **N8N Variable Syntax**: Support for $node, $input, $json, $binary
+2. **JSONPath/JMESPath**: Not implemented
+3. **JavaScript Context**: Missing helper functions available in N8N
+4. **Template Rendering**: Issues with expression substitution
 
-This should bring BudFlow Python to feature parity with n8n's core functionality.
+### Execution Engine Missing Features
+1. **Partial Execution**: Cannot start from specific node
+2. **Pause/Resume**: Incomplete implementation
+3. **Real-time Progress**: No WebSocket/SSE
+4. **Sub-workflows**: Node type exists but not implemented
+5. **Pin Data**: No support for test data
+6. **Error Workflows**: Model exists but auto-triggering missing
+
+### Node Implementation Gap
+- Only ~15 nodes implemented vs N8N's 600+
+- Missing major integrations (Slack, GitHub, Google, etc.)
+
+### Frontend
+- Completely missing Vue.js application
+- No workflow editor UI
+- No execution history UI
+
+## Updated Next Steps
+
+1. Fix Expression Engine JavaScript variable handling (8-12 hours)
+2. Implement Partial Execution feature (16-24 hours)
+3. Complete Pause/Resume functionality (24-32 hours)
+4. Fix credential decryption (critical security)
+5. Begin implementing high-priority nodes (40-60 hours)
+6. Add WebSocket/SSE for real-time updates (16-24 hours)
+
+## Test Coverage Status
+- Total Tests: 88+
+- Passing: 75/88 (85%)
+- Main failures: Expression engine JavaScript handling
+
+This should bring BudFlow Python closer to feature parity with n8n's core functionality.

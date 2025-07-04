@@ -338,7 +338,9 @@ class TestCredentialsAPI:
         async_client: AsyncClient,
         auth_headers: Dict[str, str],
         auth_headers_user2: Dict[str, str],
-        test_credential: Credential
+        test_credential: Credential,
+        test_user2: User,
+        test_session: AsyncSession
     ):
         """Test credential permission enforcement."""
         # User 2 should not have access
@@ -348,6 +350,61 @@ class TestCredentialsAPI:
         )
         
         assert response.status_code == status.HTTP_403_FORBIDDEN
+
+        # Share credential with "use" permission
+        share_data = {
+            "userIds": [str(test_user2.id)],
+            "permissions": ["use"]
+        }
+        
+        response = await async_client.put(
+            f"/api/v1/credentials/{test_credential.id}/share",
+            json=share_data,
+            headers=auth_headers
+        )
+
+        assert response.status_code == status.HTTP_200_OK
+
+        # User 2 should now have access
+        response = await async_client.get(
+            f"/api/v1/credentials/{test_credential.id}",
+            headers=auth_headers_user2
+        )
+
+        assert response.status_code == status.HTTP_200_OK
+
+        # User 2 should not be able to edit
+        update_data = {"name": "New Name"}
+        response = await async_client.patch(
+            f"/api/v1/credentials/{test_credential.id}",
+            json=update_data,
+            headers=auth_headers_user2
+        )
+
+        assert response.status_code == status.HTTP_403_FORBIDDEN
+
+        # Share credential with "edit" permission
+        share_data = {
+            "userIds": [str(test_user2.id)],
+            "permissions": ["edit"]
+        }
+
+        response = await async_client.put(
+            f"/api/v1/credentials/{test_credential.id}/share",
+            json=share_data,
+            headers=auth_headers
+        )
+
+        assert response.status_code == status.HTTP_200_OK
+
+        # User 2 should now be able to edit
+        response = await async_client.patch(
+            f"/api/v1/credentials/{test_credential.id}",
+            json=update_data,
+            headers=auth_headers_user2
+        )
+
+        assert response.status_code == status.HTTP_200_OK
 
     @pytest.mark.asyncio
     async def test_list_credential_types(

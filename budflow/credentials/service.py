@@ -351,7 +351,7 @@ class CredentialService:
         
         # Only owner can delete
         if credential.user_id != user_id:
-            raise CredentialAccessDeniedError("Only owner can delete credential")
+            raise CredentialAccessDeniedError("Only the owner can delete a credential.")
         
         await db.delete(credential)
         await db.commit()
@@ -365,34 +365,33 @@ class CredentialService:
     ) -> Credential:
         """Share a credential with other users."""
         credential = await self.get_credential(db, credential_id, user_id, check_permission=False)
-        
+
         # Only owner can share
         if credential.user_id != user_id:
             raise CredentialAccessDeniedError("Only owner can share credential")
-        
-        # Remove existing shares
-        await db.execute(
-            select(SharedCredential).where(
-                SharedCredential.credential_id == credential_id
-            ).execution_options(synchronize_session="fetch")
-        )
-        
+
+        # Remove existing shares to reset permissions
+        for share in credential.shared_with:
+            await db.delete(share)
+        await db.flush()
+
         # Add new shares
-        for share_user_id in share_data.user_ids:
-            if share_user_id == user_id:
+        for i, share_user_id in enumerate(share_data.userIds):
+            if int(share_user_id) == user_id:
                 continue  # Skip owner
-            
-            for permission in share_data.permissions:
-                shared = SharedCredential(
-                    credential_id=credential_id,
-                    user_id=share_user_id,
-                    permission=permission
-                )
-                db.add(shared)
-        
+
+            permission = share_data.permissions[i] if i < len(share_data.permissions) else 'use'
+
+            shared = SharedCredential(
+                credential_id=credential_id,
+                user_id=int(share_user_id),
+                permission=permission
+            )
+            db.add(shared)
+
         await db.commit()
         await db.refresh(credential, ["shared_with"])
-        
+
         return credential
     
     async def test_credential(

@@ -16,7 +16,7 @@ from celery.exceptions import Retry, MaxRetriesExceededError
 from celery.utils.log import get_task_logger
 
 from budflow.config import settings
-from budflow.database import get_db
+from budflow.database_deps import get_db
 from budflow.workflows.service import WorkflowService
 from budflow.executions.service import ExecutionService
 from budflow.executions.schemas import ExecutionCreate
@@ -168,7 +168,7 @@ async def _execute_workflow(
                 workflow_id=UUID(workflow_id),
                 mode=execution_mode,
                 data={
-                    **initial_data or {},
+                    **(initial_data or {}),
                     "_trigger": trigger_data,
                     "_parent_execution_id": parent_execution_id
                 }

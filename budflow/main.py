@@ -191,9 +191,14 @@ def create_app() -> FastAPI:
     app.include_router(credentials_router, prefix="/api/v1", tags=["Credentials"])
     app.include_router(nodes_router, tags=["Nodes"])
     
+    # Webhook routers
+    from budflow.webhooks.routes import webhook_router, webhook_test_router, webhook_waiting_router
+    app.include_router(webhook_router, prefix="/webhook", tags=["Webhooks"])
+    app.include_router(webhook_test_router, prefix="/webhook-test", tags=["Webhooks"])
+    app.include_router(webhook_waiting_router, prefix="/webhook-waiting", tags=["Webhooks"])
+    
     # Additional routers (to be added)
     # app.include_router(integrations_router, prefix="/api/v1/integrations", tags=["Integrations"])
-    # app.include_router(webhooks_router, prefix="/api/v1/webhooks", tags=["Webhooks"])
 
     return app
 

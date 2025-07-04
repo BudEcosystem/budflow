@@ -210,6 +210,7 @@ class WebhookService:
         method: str,
         request: Request,
         body: Union[Dict[str, Any], bytes, None] = None,
+        test_mode: bool = False,
     ) -> WebhookResponse:
         """Handle incoming webhook request."""
         webhook_method = WebhookMethod(method.upper())
@@ -581,3 +582,43 @@ class WebhookService:
                 "status": "success",
                 "data": [{"json": input_data}],
             }
+    
+    async def handle_waiting_webhook(
+        self,
+        execution_id: str,
+        request: Request,
+        body: Optional[Dict[str, Any]] = None,
+    ) -> WebhookResponse:
+        """
+        Handle webhook for resuming waiting executions.
+        
+        This is used by wait nodes to resume workflow execution
+        when an external event occurs.
+        
+        Args:
+            execution_id: The execution ID to resume
+            request: The incoming request
+            body: The request body data
+            
+        Returns:
+            WebhookResponse with the result
+        """
+        # TODO: Implement execution resumption logic
+        # For now, return a placeholder response
+        
+        # In a real implementation, this would:
+        # 1. Find the waiting execution by ID
+        # 2. Verify the execution is in waiting state
+        # 3. Resume the execution with the provided data
+        # 4. Return the result
+        
+        return WebhookResponse(
+            status_code=200,
+            body={
+                "resumed": True,
+                "execution_id": execution_id,
+                "data": body or {},
+                "timestamp": datetime.utcnow().isoformat(),
+            },
+            headers={"Content-Type": "application/json"},
+        )

@@ -48,6 +48,7 @@ class ExecutionMode(str, Enum):
     WEBHOOK = "webhook"
     SCHEDULE = "schedule"
     TEST = "test"
+    SUBWORKFLOW = "subworkflow"
 
 
 class ExecutionStatus(str, Enum):
@@ -225,7 +226,7 @@ class WorkflowNode(Base):
     
     # Workflow relationship
     workflow_id: Mapped[int] = mapped_column(Integer, ForeignKey("workflows.id"), nullable=False)
-    workflow: Mapped["Workflow"] = relationship("Workflow", back_populates="nodes")
+    workflow: Mapped["Workflow"] = relationship("Workflow", back_populates="workflow_nodes")
     
     # Node configuration
     name: Mapped[str] = mapped_column(String(255), nullable=False)
@@ -326,7 +327,7 @@ class WorkflowConnection(Base):
     
     # Workflow relationship
     workflow_id: Mapped[int] = mapped_column(Integer, ForeignKey("workflows.id"), nullable=False)
-    workflow: Mapped["Workflow"] = relationship("Workflow", back_populates="connections")
+    workflow: Mapped["Workflow"] = relationship("Workflow", back_populates="workflow_connections")
     
     # Connection endpoints
     source_node_id: Mapped[int] = mapped_column(Integer, ForeignKey("workflow_nodes.id"), nullable=False)
@@ -411,6 +412,10 @@ class WorkflowExecution(Base):
     data: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON)  # Input data
     error: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON)  # Error details
     
+    # Partial execution support
+    start_node: Mapped[Optional[str]] = mapped_column(String(255))  # Starting node for partial execution
+    execution_type: Mapped[str] = mapped_column(String(50), default="full")  # "full" or "partial"
+    
     # Queue integration
     job_id: Mapped[Optional[str]] = mapped_column(String(36))  # Queue job ID for tracking
     
@@ -441,10 +446,15 @@ class WorkflowExecution(Base):
         "NodeExecution", back_populates="workflow_execution", cascade="all, delete-orphan"
     )
     retries: Mapped[List["WorkflowExecution"]] = relationship(
-        "WorkflowExecution", back_populates="original_execution"
+        "WorkflowExecution", 
+        foreign_keys=lambda: [WorkflowExecution.retry_of],
+        back_populates="original_execution"
     )
     original_execution: Mapped[Optional["WorkflowExecution"]] = relationship(
-        "WorkflowExecution", remote_side=[id], back_populates="retries"
+        "WorkflowExecution", 
+        foreign_keys=[retry_of],
+        remote_side=[id], 
+        back_populates="retries"
     )
     
     # Parent-child relationships for workflow composition
@@ -456,6 +466,7 @@ class WorkflowExecution(Base):
     )
     child_executions: Mapped[List["WorkflowExecution"]] = relationship(
         "WorkflowExecution", 
+        foreign_keys=lambda: [WorkflowExecution.parent_execution_id],
         back_populates="parent_execution",
         cascade="all, delete-orphan"
     )

@@ -12,7 +12,7 @@ class Settings(BaseSettings):
     """Application settings."""
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=os.getenv("ENV_FILE", ".env"),
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",
@@ -182,6 +182,10 @@ class Settings(BaseSettings):
         default=30, description="Health check timeout"
     )
 
+    # Execution
+    max_execution_time: int = Field(default=3600, description="Maximum execution time in seconds")
+    execution_retention_days: int = Field(default=30, description="Number of days to retain execution history")
+
     @property
     def is_development(self) -> bool:
         """Check if running in development mode."""
@@ -198,10 +202,16 @@ class Settings(BaseSettings):
         return self.environment.lower() in ("testing", "test")
 
 
+from dotenv import dotenv_values
+
 @lru_cache()
 def get_settings() -> Settings:
     """Get application settings (cached)."""
-    return Settings()
+    env_file = os.getenv("ENV_FILE", ".env")
+    # Get the absolute path to the env file
+    env_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), env_file)
+    config = dotenv_values(env_path)
+    return Settings(**config)
 
 
 # Global settings instance
